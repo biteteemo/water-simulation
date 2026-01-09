@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Fri Jan  9 13:08:04 2026
-
-@author: zouxu
-"""
-
-# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -33,7 +26,12 @@ except ImportError:
 # 设置页面配置
 st.set_page_config(page_title="城市雨水管网水力模拟系统", layout="wide")
 
-# 初始化 Session State 用于存储选中的管道
+# ==========================================
+# 0. 初始化 Session State
+# ==========================================
+# 我们需要两个状态：
+# 1. selected_pipe_id: 存储当前选中的真实 PipeID
+# 2. pipe_selector: 绑定到下拉框的 key，用于强制更新 UI
 if 'selected_pipe_id' not in st.session_state:
     st.session_state['selected_pipe_id'] = None
 
@@ -100,7 +98,7 @@ class VectorizedHydraulics:
         return h, v
 
 # ==========================================
-# 2. 数据处理 (保持不变)
+# 2. 数据处理
 # ==========================================
 @st.cache_data
 def load_data(uploaded_file):
@@ -138,7 +136,7 @@ def load_data(uploaded_file):
     if 'Manning' not in df.columns:
         df['Manning'] = 0.013
     
-    # 确保 PipeID 是字符串，方便后续匹配
+    # 确保 PipeID 是字符串
     df['PipeID'] = df['PipeID'].astype(str)
         
     return df, None, has_coords
@@ -147,6 +145,7 @@ def convert_coordinates(df):
     if not PYPROJ_AVAILABLE:
         return df, "未安装 pyproj 库，无法进行坐标转换。"
     
+    # 简单的判断：如果坐标很小，可能已经是经纬度
     if df['US_X'].mean() < 180:
         return df, None 
 
@@ -204,7 +203,7 @@ st.sidebar.header("2. 模拟参数")
 sim_hours = st.sidebar.slider("模拟时长 (小时)", 12, 48, 24)
 default_n = st.sidebar.number_input("默认曼宁系数", 0.010, 0.020, 0.013, format="%.3f")
 
-# 运行模拟的函数 (封装以便调用)
+# 运行模拟的函数
 def run_simulation(G, df_pipe, hours):
     solver = VectorizedHydraulics()
     topo_nodes = list(nx.topological_sort(G))
@@ -276,45 +275,48 @@ if uploaded_file:
         # 布局：左侧地图，右侧/下方详情
         col_map, col_details = st.columns([1.5, 1])
         
+        # 准备地图数据（放在列外面，因为后续逻辑需要用到 df_map）
+        df_map = df_pipe.copy()
+        if has_coords:
+            df_map, trans_status = convert_coordinates(df_map)
+            # ★★★ 关键修复：重置索引，确保 pydeck 返回的 index 能对应上 ★★★
+            df_map = df_map.reset_index(drop=True)
+            
+            if trans_status == "HK80":
+                x_col_us, y_col_us = 'US_X_WGS84', 'US_Y_WGS84'
+                x_col_ds, y_col_ds = 'DS_X_WGS84', 'DS_Y_WGS84'
+            else:
+                x_col_us, y_col_us = 'US_X', 'US_Y'
+                x_col_ds, y_col_ds = 'DS_X', 'DS_Y'
+
+            d_min, d_max = df_map['Diameter'].min(), df_map['Diameter'].max()
+            def get_color(d):
+                if d_max == d_min: ratio = 0.5
+                else: ratio = (d - d_min) / (d_max - d_min)
+                r = int(255 * ratio)
+                g = int(255 * (1 - ratio))
+                return [r, g, 0, 200]
+            df_map['color'] = df_map['Diameter'].apply(get_color)
+
         with col_map:
             st.subheader("🗺️ GIS 管网交互地图")
             if has_coords:
-                df_map = df_pipe.copy()
-                df_map, trans_status = convert_coordinates(df_map)
-                
-                if trans_status == "HK80":
-                    x_col_us, y_col_us = 'US_X_WGS84', 'US_Y_WGS84'
-                    x_col_ds, y_col_ds = 'DS_X_WGS84', 'DS_Y_WGS84'
-                else:
-                    x_col_us, y_col_us = 'US_X', 'US_Y'
-                    x_col_ds, y_col_ds = 'DS_X', 'DS_Y'
-
-                d_min, d_max = df_map['Diameter'].min(), df_map['Diameter'].max()
-                def get_color(d):
-                    if d_max == d_min: ratio = 0.5
-                    else: ratio = (d - d_min) / (d_max - d_min)
-                    r = int(255 * ratio)
-                    g = int(255 * (1 - ratio))
-                    return [r, g, 0, 200]
-                df_map['color'] = df_map['Diameter'].apply(get_color)
-                
                 mid_lat = (df_map[y_col_us].mean() + df_map[y_col_ds].mean()) / 2
                 mid_lon = (df_map[x_col_us].mean() + df_map[x_col_ds].mean()) / 2
 
                 layer = pdk.Layer(
                     "LineLayer",
-                    df_map,
+                    df_map, # 这里传入的是已经 reset_index 的数据
                     get_source_position=[x_col_us, y_col_us],
                     get_target_position=[x_col_ds, y_col_ds],
                     get_color="color",
-                    get_width=5, # 加宽一点方便点击
+                    get_width=5,
                     pickable=True,
                     auto_highlight=True,
                 )
 
                 view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=13, pitch=0)
 
-                # ★★★ 关键修改：启用选择模式 ★★★
                 deck = pdk.Deck(
                     layers=[layer],
                     initial_view_state=view_state,
@@ -322,7 +324,7 @@ if uploaded_file:
                     tooltip={"text": "点击查看详情\nID: {PipeID}"}
                 )
                 
-                # 渲染地图并捕获点击事件
+                # 渲染地图
                 selection = st.pydeck_chart(
                     deck, 
                     on_select="rerun", 
@@ -330,13 +332,20 @@ if uploaded_file:
                     use_container_width=True
                 )
                 
-                # 处理点击逻辑
+                # ★★★ 关键修复：处理点击逻辑 ★★★
                 if selection.selection:
                     indices = selection.selection.get("indices")
                     if indices:
                         clicked_index = indices[0]
+                        # 使用 reset_index 后的 df_map 获取 ID
                         clicked_pipe_id = df_map.iloc[clicked_index]['PipeID']
-                        st.session_state['selected_pipe_id'] = clicked_pipe_id
+                        
+                        # 如果点击了新的管段，更新 session state 并强制刷新
+                        if clicked_pipe_id != st.session_state['selected_pipe_id']:
+                            st.session_state['selected_pipe_id'] = clicked_pipe_id
+                            # 同时更新下拉框的 key，确保 UI 同步
+                            st.session_state['pipe_selector'] = clicked_pipe_id
+                            st.rerun()
             else:
                 st.warning("无坐标数据，无法显示地图")
 
@@ -357,60 +366,69 @@ if uploaded_file:
             st.divider()
 
             # 2. 结果展示
-            current_pipe_id = st.session_state['selected_pipe_id']
-            
-            # 如果没有点击地图，默认选第一个
-            if current_pipe_id is None and len(df_pipe) > 0:
-                current_pipe_id = df_pipe.iloc[0]['PipeID']
+            # 如果还没有选中任何管段，默认选第一个
+            if st.session_state['selected_pipe_id'] is None and len(df_pipe) > 0:
+                first_id = df_pipe.iloc[0]['PipeID']
+                st.session_state['selected_pipe_id'] = first_id
+                # 初始化下拉框的 key
+                if 'pipe_selector' not in st.session_state:
+                    st.session_state['pipe_selector'] = first_id
 
-            # 下拉框同步显示（允许用户手动选，也允许地图点选）
-            # 找到当前ID在列表中的索引
             all_ids = df_pipe['PipeID'].values.tolist()
-            try:
-                default_idx = all_ids.index(str(current_pipe_id))
-            except ValueError:
-                default_idx = 0
             
+            # 回调函数：当用户手动改变下拉框时触发
+            def on_pipe_select_change():
+                st.session_state['selected_pipe_id'] = st.session_state['pipe_selector']
+
+            # 下拉框
+            # key='pipe_selector' 绑定了 session_state 中的值
+            # 当地图点击更新了 session_state['pipe_selector'] 后，这个下拉框会自动跳到对应的值
             selected_pipe = st.selectbox(
                 "当前选中管段:", 
                 all_ids, 
-                index=default_idx,
-                key="pipe_selector"
+                key="pipe_selector",
+                on_change=on_pipe_select_change
             )
             
-            # 如果下拉框变了，更新 session state (双向绑定)
-            if selected_pipe != st.session_state['selected_pipe_id']:
-                st.session_state['selected_pipe_id'] = selected_pipe
+            # 确保 selected_pipe_id 与下拉框保持一致 (双重保险)
+            current_pipe_id = selected_pipe
 
             # 展示选中管段的静态属性
-            pipe_info = df_pipe[df_pipe['PipeID'] == selected_pipe].iloc[0]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("管径", f"{pipe_info['Diameter']} m")
-            c2.metric("长度", f"{pipe_info['Length']} m")
-            c3.metric("坡度", f"{pipe_info['Slope']:.4f}")
+            pipe_row = df_pipe[df_pipe['PipeID'] == current_pipe_id]
+            if not pipe_row.empty:
+                pipe_info = pipe_row.iloc[0]
+                c1, c2, c3 = st.columns(3)
+                c1.metric("管径", f"{pipe_info['Diameter']} m")
+                c2.metric("长度", f"{pipe_info['Length']} m")
+                c3.metric("坡度", f"{pipe_info['Slope']:.4f}")
 
-            # 展示动态结果
-            if st.session_state.get('has_results', False):
-                idx = np.where(st.session_state['all_pipe_ids'] == selected_pipe)[0][0]
-                ts_Q = st.session_state['res_Q'][idx, :]
-                ts_v = st.session_state['res_v'][idx, :]
-                ts_h = st.session_state['res_h'][idx, :]
-                hours_arr = np.arange(sim_hours)
-                
-                if PLOTLY_AVAILABLE:
-                    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                                        vertical_spacing=0.05,
-                                        subplot_titles=("流量 Q (m³/s)", "流速 v (m/s)", "水深 h (m)"))
-                    fig.add_trace(go.Scatter(x=hours_arr, y=ts_Q, name="流量", line=dict(color='#3b82f6')), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=hours_arr, y=ts_v, name="流速", line=dict(color='#f97316')), row=2, col=1)
-                    fig.add_trace(go.Scatter(x=hours_arr, y=ts_h, name="水深", line=dict(color='#22c55e'), fill='tozeroy'), row=3, col=1)
-                    fig.add_hline(y=pipe_info['Diameter'], line_dash="dash", line_color="red", annotation_text="管顶", row=3, col=1)
-                    fig.update_layout(height=500, margin=dict(l=0, r=0, t=20, b=0), showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
+                # 展示动态结果
+                if st.session_state.get('has_results', False):
+                    try:
+                        idx = np.where(st.session_state['all_pipe_ids'] == current_pipe_id)[0][0]
+                        ts_Q = st.session_state['res_Q'][idx, :]
+                        ts_v = st.session_state['res_v'][idx, :]
+                        ts_h = st.session_state['res_h'][idx, :]
+                        hours_arr = np.arange(sim_hours)
+                        
+                        if PLOTLY_AVAILABLE:
+                            fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
+                                                vertical_spacing=0.05,
+                                                subplot_titles=("流量 Q (m³/s)", "流速 v (m/s)", "水深 h (m)"))
+                            fig.add_trace(go.Scatter(x=hours_arr, y=ts_Q, name="流量", line=dict(color='#3b82f6')), row=1, col=1)
+                            fig.add_trace(go.Scatter(x=hours_arr, y=ts_v, name="流速", line=dict(color='#f97316')), row=2, col=1)
+                            fig.add_trace(go.Scatter(x=hours_arr, y=ts_h, name="水深", line=dict(color='#22c55e'), fill='tozeroy'), row=3, col=1)
+                            fig.add_hline(y=pipe_info['Diameter'], line_dash="dash", line_color="red", annotation_text="管顶", row=3, col=1)
+                            fig.update_layout(height=500, margin=dict(l=0, r=0, t=20, b=0), showlegend=False)
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.line_chart(pd.DataFrame({'Q': ts_Q, 'v': ts_v, 'h': ts_h}))
+                    except IndexError:
+                        st.error("未找到该管段的模拟结果，请重新运行模拟。")
                 else:
-                    st.line_chart(pd.DataFrame({'Q': ts_Q, 'v': ts_v, 'h': ts_h}))
+                    st.info("👆 请先点击上方的“开始模拟计算”按钮查看水力结果。")
             else:
-                st.info("👆 请先点击上方的“开始模拟计算”按钮查看水力结果。")
+                st.error("数据中找不到该管段ID")
 
 else:
     st.info("请在左侧上传数据文件。")
