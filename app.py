@@ -103,7 +103,7 @@ class VectorizedHydraulics:
         return h, v
 
 # ==========================================
-# 2. 数据处理函数 (保持不变)
+# 2. 数据处理函数
 # ==========================================
 @st.cache_data
 def load_and_process_data(uploaded_file):
@@ -135,9 +135,11 @@ def load_and_process_data(uploaded_file):
     if missing:
         return None, f"缺少关键列: {', '.join(missing)}", False
     
+    # 强制转换为字符串，避免类型混淆
     df['PipeID'] = df['PipeID'].astype(str)
     df['UpstreamNode'] = df['UpstreamNode'].astype(str)
     df['DownstreamNode'] = df['DownstreamNode'].astype(str)
+    
     df['Slope'] = pd.to_numeric(df['Slope'], errors='coerce').abs()
     df.loc[df['Slope'] < 0.0001, 'Slope'] = 0.001
     
@@ -194,7 +196,7 @@ def generate_inflows(nodes, hours=24):
     return node_inflows
 
 # ==========================================
-# 3. 模拟逻辑 (保持不变)
+# 3. 模拟逻辑
 # ==========================================
 def run_simulation_logic(G, df_pipe, hours):
     solver = VectorizedHydraulics()
@@ -254,12 +256,14 @@ def run_simulation_logic(G, df_pipe, hours):
     }
 
 # ==========================================
-# 4. 详情显示组件 (修改为普通函数)
+# 4. 详情显示组件
 # ==========================================
 def render_pipe_details(pipe_id, df_pipe, sim_hours):
     """
     在当前容器中渲染管道详情
     """
+    # 确保类型一致
+    pipe_id = str(pipe_id)
     pipe_row = df_pipe[df_pipe['PipeID'] == pipe_id]
     
     if pipe_row.empty:
@@ -282,8 +286,10 @@ def render_pipe_details(pipe_id, df_pipe, sim_hours):
     
     if st.session_state['has_results']:
         try:
-            # 查找结果索引
-            idx = np.where(st.session_state['all_pipe_ids'] == pipe_id)[0]
+            # 查找结果索引 (确保类型匹配)
+            all_ids = st.session_state['all_pipe_ids'].astype(str)
+            idx = np.where(all_ids == pipe_id)[0]
+            
             if len(idx) == 0:
                 st.warning("该管道不在计算结果中")
                 return
@@ -392,10 +398,16 @@ if uploaded_file and not error_msg:
             else:
                 x_us, y_us, x_ds, y_ds = 'US_X', 'US_Y', 'DS_X', 'DS_Y'
 
-            # 样式计算
+            # --- 样式计算 & 高亮逻辑 ---
             d_min, d_max = df_map['Diameter'].min(), df_map['Diameter'].max()
+            current_selected = st.session_state.get('selected_pipe_id')
 
             def get_style(row):
+                # 如果是当前选中的管道，返回高亮色（品红）
+                if str(row['PipeID']) == str(current_selected):
+                    return pd.Series([[255, 0, 255, 255], max(5, row['Diameter'] * 8)])
+                
+                # 否则返回默认颜色（基于管径的蓝绿色系）
                 d = row['Diameter']
                 if d_max == d_min: ratio = 0.5
                 else: ratio = (d - d_min) / (d_max - d_min)
@@ -417,8 +429,8 @@ if uploaded_file and not error_msg:
                 ux, uy = dx/length, dy/length
                 vx, vy = -uy, ux
                 
-                # 调整后的箭头尺寸 (更小)
-                scale = 0.00006  # 之前是 0.00015
+                # 调整后的箭头尺寸
+                scale = 0.00006 
                 
                 p1 = [mx + ux * scale * 1.5, my + uy * scale * 1.5]
                 p2 = [mx - ux * scale + vx * scale * 0.8, my - uy * scale + vy * scale * 0.8]
@@ -433,7 +445,7 @@ if uploaded_file and not error_msg:
 
             layers_list = []
 
-            # 1. 管道线条层 (始终显示)
+            # 1. 管道线条层 (始终显示，可点击)
             line_layer = pdk.Layer(
                 "LineLayer",
                 df_map,
@@ -442,27 +454,28 @@ if uploaded_file and not error_msg:
                 get_color="color",
                 get_width="width",
                 width_min_pixels=2,
-                pickable=True,
+                pickable=True, # 关键：允许点击
                 auto_highlight=True,
                 highlight_color=[255, 255, 0, 255],
             )
             layers_list.append(line_layer)
 
-            # 2. 箭头层 (根据开关显示)
+            # 2. 箭头层 (根据开关显示，可点击)
             if show_arrows:
                 arrow_layer = pdk.Layer(
                     "PolygonLayer",
                     df_map,
                     get_polygon="arrow_polygon",
                     get_fill_color=[255, 255, 255, 200],
-                    pickable=False,
-                    stroked=False
+                    pickable=True, # 关键：允许点击箭头选中管道
+                    stroked=False,
+                    auto_highlight=True,
+                    highlight_color=[255, 0, 255, 255],
                 )
                 layers_list.append(arrow_layer)
             
-            # 3. 节点层 (根据开关显示)
+            # 3. 节点层 (根据开关显示，不可点击)
             if show_nodes:
-                # 提取唯一的上游节点作为进水节点
                 nodes_df = df_map.groupby('UpstreamNode').agg({
                     x_us: 'first',
                     y_us: 'first'
@@ -472,10 +485,9 @@ if uploaded_file and not error_msg:
                     "ScatterplotLayer",
                     nodes_df,
                     get_position=[x_us, y_us],
-                    get_radius=10, # 米
-                    get_fill_color=[255, 0, 0, 200], # 红色
-                    pickable=True,
-                    auto_highlight=True
+                    get_radius=10, 
+                    get_fill_color=[255, 0, 0, 200], 
+                    pickable=False, # 关键：禁止点击节点，防止索引混淆
                 )
                 layers_list.append(node_layer)
 
@@ -484,7 +496,7 @@ if uploaded_file and not error_msg:
                 initial_view_state=view_state,
                 map_style='mapbox://styles/mapbox/dark-v10',
                 tooltip={
-                    "html": "<b>ID:</b> {PipeID}<br/><b>管径:</b> {Diameter}m<br/><b>节点:</b> {UpstreamNode}"
+                    "html": "<b>ID:</b> {PipeID}<br/><b>管径:</b> {Diameter}m"
                 }
             )
             
@@ -497,29 +509,24 @@ if uploaded_file and not error_msg:
                 height=600
             )
             
-            # 处理选择逻辑
+            # --- 核心修复：更健壮的选择逻辑 ---
             if event.selection:
+                # 获取被点击对象的索引
                 indices = event.selection.get("indices")
-                # 确保选中的是 LineLayer (索引对应 df_map)
-                # 注意：如果点击的是 ScatterplotLayer (节点)，indices 也会有值，但对应的是 nodes_df
-                # 这里我们简单处理：如果点击了对象，且该对象看起来像管道（有PipeID），则更新状态
-                # 由于 PyDeck 的 selection 返回比较通用，这里主要针对管道点击优化
                 
-                # 只有当点击的是 LineLayer 时，我们才更新管道详情
-                # 我们可以通过判断 layerId 或者简单的假设：管道数量通常远大于节点，或者通过业务逻辑判断
-                # 简单起见，我们假设用户主要点击管道。
+                # 只有当索引存在，且我们确定点击的是 line 或 arrow 层（它们共享 df_map）时才更新
+                # 由于 node 层 pickable=False，所以这里的 index 一定对应 df_map
                 if indices:
-                    # 尝试从 df_map 获取
                     try:
                         idx = indices[0]
-                        # 这是一个简化的假设，假设点击的是第一个层(LineLayer)的数据
-                        # 如果点击的是节点层，索引可能越界或指向错误数据，这里做个简单保护
                         if idx < len(df_map):
-                             # 检查是否点击的是节点层 (PyDeck selection info 不太容易区分层)
-                             # 但因为我们主要关注管道详情，这里直接取 df_map
-                             selected_id = df_map.iloc[idx]['PipeID']
-                             st.session_state['selected_pipe_id'] = selected_id
-                    except:
+                            selected_id = str(df_map.iloc[idx]['PipeID'])
+                            # 只有当 ID 真正改变时才更新，避免不必要的刷新
+                            if st.session_state['selected_pipe_id'] != selected_id:
+                                st.session_state['selected_pipe_id'] = selected_id
+                                st.rerun() # 强制刷新以更新右侧详情和地图高亮
+                    except Exception as e:
+                        print(f"Selection Error: {e}")
                         pass
 
         else:
@@ -536,7 +543,7 @@ if uploaded_file and not error_msg:
             1. 缩放地图查看管网细节。
             2. 点击 **显示流向箭头** 查看水流方向。
             3. 点击 **显示进水节点** 查看进水口位置。
-            4. 选中管道后，此处将显示水力模拟结果。
+            4. 选中管道（变粉色）后，此处将显示水力模拟结果。
             """)
 
 else:
