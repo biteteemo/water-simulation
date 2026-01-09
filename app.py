@@ -344,31 +344,21 @@ if uploaded_file:
                     tooltip={"html": "<b>ID:</b> {PipeID}<br/><b>管径:</b> {Diameter}m"}
                 )
                 
-                # 渲染地图
                 selection = st.pydeck_chart(
                     deck, 
-                    on_select="rerun", # 点击触发重运行
+                    on_select="rerun",
                     selection_mode="single-object",
                     use_container_width=True
                 )
                 
-                # --- 核心修复逻辑 ---
-                # 检查是否有选中事件
                 if selection.selection:
                     indices = selection.selection.get("indices")
-                    # 确保 indices 存在且非空
                     if indices:
                         clicked_idx = indices[0]
-                        # 从 df_map 中获取对应的 ID
                         clicked_id = df_map.iloc[clicked_idx]['PipeID']
-                        
-                        # 只有当 ID 真正改变时才更新，防止死循环
                         if clicked_id != st.session_state['selected_pipe_id']:
                             st.session_state['selected_pipe_id'] = clicked_id
-                            # 【关键】同时强制更新下拉框绑定的 key 值
                             st.session_state['pipe_selector'] = clicked_id
-                            # 注意：这里不需要 st.rerun()，因为 on_select="rerun" 已经触发了当前的运行
-                            # 代码继续向下执行时，下拉框会读取到新的 session state
             else:
                 st.info("无坐标数据，无法显示地图。")
 
@@ -402,25 +392,18 @@ if uploaded_file:
             # 管道列表
             all_ids = df_pipe['PipeID'].values.tolist()
             
-            # 确保有默认值
             if st.session_state['selected_pipe_id'] is None and all_ids:
                 st.session_state['selected_pipe_id'] = all_ids[0]
                 st.session_state['pipe_selector'] = all_ids[0]
 
-            # 回调：下拉框手动改变时更新 selected_pipe_id
             def on_selector_change():
                 st.session_state['selected_pipe_id'] = st.session_state['pipe_selector']
 
-            # 计算当前 index，增加安全性
             try:
                 current_index = all_ids.index(st.session_state['selected_pipe_id'])
             except (ValueError, TypeError):
                 current_index = 0
 
-            # 下拉框
-            # Streamlit 机制：如果 session_state 中存在 key='pipe_selector'，
-            # 组件会优先使用 session_state 中的值，而不是 index 参数。
-            # 因此我们在地图点击逻辑中更新了 session_state['pipe_selector']，这里就会自动生效。
             selected_id = st.selectbox(
                 "选择管段查看详情:", 
                 options=all_ids,
@@ -433,11 +416,15 @@ if uploaded_file:
             pipe_row = df_pipe[df_pipe['PipeID'] == selected_id]
             if not pipe_row.empty:
                 info = pipe_row.iloc[0]
+                
+                # 1. 显示基础属性
+                st.markdown("##### 📌 基础属性")
                 c1, c2, c3 = st.columns(3)
                 c1.metric("管径", f"{info['Diameter']} m")
                 c2.metric("管长", f"{info['Length']} m")
                 c3.metric("坡度", f"{info['Slope']:.4f}")
                 
+                # 2. 显示模拟统计结果 (新增部分)
                 if st.session_state['has_results']:
                     try:
                         idx = np.where(st.session_state['all_pipe_ids'] == selected_id)[0][0]
@@ -446,6 +433,18 @@ if uploaded_file:
                         ts_h = st.session_state['res_h'][idx, :]
                         hours_arr = np.arange(sim_hours)
                         
+                        # 计算平均值
+                        avg_Q = np.mean(ts_Q)
+                        avg_v = np.mean(ts_v)
+                        avg_h = np.mean(ts_h)
+                        
+                        st.markdown("##### 📊 模拟统计 (平均值)")
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("平均流量", f"{avg_Q:.4f} m³/s")
+                        m2.metric("平均流速", f"{avg_v:.4f} m/s")
+                        m3.metric("平均水深", f"{avg_h:.4f} m")
+                        
+                        st.markdown("##### 📉 过程线")
                         if PLOTLY_AVAILABLE:
                             fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
                                                 subplot_titles=("流量 Q (m³/s)", "流速 v (m/s)", "水深 h (m)"))
