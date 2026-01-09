@@ -19,7 +19,6 @@ st.set_page_config(
 
 warnings.filterwarnings('ignore')
 
-# 检查可选依赖
 try:
     from pyproj import Transformer
     PYPROJ_AVAILABLE = True
@@ -33,7 +32,6 @@ try:
 except ImportError:
     PLOTLY_AVAILABLE = False
 
-# 初始化 Session State
 DEFAULT_STATE = {
     'selected_pipe_id': None,
     'pipe_selector': None,
@@ -53,9 +51,6 @@ for key, val in DEFAULT_STATE.items():
 # 1. 核心计算类 (Vectorized Hydraulics)
 # ==========================================
 class VectorizedHydraulics:
-    """
-    基于曼宁公式的矢量化水力计算器
-    """
     def solve_normal_depth(self, Q_target, D, S, n):
         S = np.where(S <= 1e-6, 1e-6, S)
         sqrt_S = np.sqrt(S)
@@ -303,7 +298,6 @@ if uploaded_file:
             df_map = df_pipe.copy()
             if has_coords:
                 df_map, trans_status = convert_coordinates(df_map)
-                # 关键：重置索引以确保 PyDeck 返回的 indices 与 DataFrame 行号一致
                 df_map = df_map.reset_index(drop=True)
                 
                 if trans_status == "HK80":
@@ -312,13 +306,29 @@ if uploaded_file:
                     x_us, y_us, x_ds, y_ds = 'US_X', 'US_Y', 'DS_X', 'DS_Y'
 
                 d_min, d_max = df_map['Diameter'].min(), df_map['Diameter'].max()
-                def get_color(d):
+                
+                # 定义颜色和宽度逻辑
+                current_selected_id = str(st.session_state.get('selected_pipe_id', ''))
+
+                def get_base_color_and_width(row):
+                    d = row['Diameter']
+                    pid = str(row['PipeID'])
+                    
+                    # 默认颜色计算
                     if d_max == d_min: ratio = 0.5
                     else: ratio = (d - d_min) / (d_max - d_min)
-                    return [int(0 + 100*ratio), int(100 + 155*ratio), 255]
-                
-                df_map['color'] = df_map['Diameter'].apply(get_color)
-                df_map['width'] = df_map['Diameter'].apply(lambda x: max(2, x * 5))
+                    
+                    # 检查是否被选中
+                    if pid == current_selected_id:
+                        color = [255, 0, 0, 255] # 红色高亮
+                        width = max(2, d * 5) * 4 # 4倍宽度
+                    else:
+                        color = [int(0 + 100*ratio), int(100 + 155*ratio), 255, 180] # 默认蓝绿色
+                        width = max(2, d * 5)
+                    
+                    return pd.Series([color, width])
+
+                df_map[['color', 'width']] = df_map.apply(get_base_color_and_width, axis=1)
 
                 mid_lat = (df_map[y_us].mean() + df_map[y_ds].mean()) / 2
                 mid_lon = (df_map[x_us].mean() + df_map[x_ds].mean()) / 2
@@ -359,6 +369,7 @@ if uploaded_file:
                         if clicked_id != st.session_state['selected_pipe_id']:
                             st.session_state['selected_pipe_id'] = clicked_id
                             st.session_state['pipe_selector'] = clicked_id
+                            st.rerun()
             else:
                 st.info("无坐标数据，无法显示地图。")
 
@@ -424,7 +435,7 @@ if uploaded_file:
                 c2.metric("管长", f"{info['Length']} m")
                 c3.metric("坡度", f"{info['Slope']:.4f}")
                 
-                # 2. 显示模拟统计结果 (新增部分)
+                # 2. 显示模拟统计结果
                 if st.session_state['has_results']:
                     try:
                         idx = np.where(st.session_state['all_pipe_ids'] == selected_id)[0][0]
