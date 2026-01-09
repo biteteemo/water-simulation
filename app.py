@@ -33,6 +33,7 @@ try:
 except ImportError:
     PLOTLY_AVAILABLE = False
 
+# 初始化 Session State
 DEFAULT_STATE = {
     'selected_pipe_id': None,
     'has_results': False,
@@ -41,7 +42,6 @@ DEFAULT_STATE = {
     'res_h': None,
     'all_pipe_ids': None,
     'simulation_params': {},
-    'show_dialog': False
 }
 
 for key, val in DEFAULT_STATE.items():
@@ -49,7 +49,7 @@ for key, val in DEFAULT_STATE.items():
         st.session_state[key] = val
 
 # ==========================================
-# 1. 核心计算类
+# 1. 核心计算类 (保持不变)
 # ==========================================
 class VectorizedHydraulics:
     def solve_normal_depth(self, Q_target, D, S, n):
@@ -103,7 +103,7 @@ class VectorizedHydraulics:
         return h, v
 
 # ==========================================
-# 2. 数据处理函数
+# 2. 数据处理函数 (保持不变)
 # ==========================================
 @st.cache_data
 def load_and_process_data(uploaded_file):
@@ -194,7 +194,7 @@ def generate_inflows(nodes, hours=24):
     return node_inflows
 
 # ==========================================
-# 3. 模拟逻辑
+# 3. 模拟逻辑 (保持不变)
 # ==========================================
 def run_simulation_logic(G, df_pipe, hours):
     solver = VectorizedHydraulics()
@@ -254,57 +254,73 @@ def run_simulation_logic(G, df_pipe, hours):
     }
 
 # ==========================================
-# 4. 弹窗显示逻辑
+# 4. 弹窗显示逻辑 (重要修改)
 # ==========================================
 @st.dialog("管道详情", width="large")
 def show_pipe_details(pipe_id, df_pipe, sim_hours):
+    """
+    显示管道详情的弹窗函数
+    """
     pipe_row = df_pipe[df_pipe['PipeID'] == pipe_id]
-    if not pipe_row.empty:
-        info = pipe_row.iloc[0]
-        
-        st.markdown("##### 📌 基础属性")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("管径", f"{info['Diameter']} m")
-        c2.metric("管长", f"{info['Length']} m")
-        c3.metric("坡度", f"{info['Slope']:.4f}")
-        
-        if st.session_state['has_results']:
-            try:
-                idx = np.where(st.session_state['all_pipe_ids'] == pipe_id)[0][0]
-                ts_Q = st.session_state['res_Q'][idx, :]
-                ts_v = st.session_state['res_v'][idx, :]
-                ts_h = st.session_state['res_h'][idx, :]
-                hours_arr = np.arange(sim_hours)
+    
+    if pipe_row.empty:
+        st.error(f"未找到管道 ID: {pipe_id}")
+        return
+
+    info = pipe_row.iloc[0]
+    
+    st.markdown(f"### 📍 管道 ID: {pipe_id}")
+    
+    st.markdown("##### 📌 基础属性")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("管径 (Diameter)", f"{info['Diameter']} m")
+    c2.metric("管长 (Length)", f"{info['Length']} m")
+    c3.metric("坡度 (Slope)", f"{info['Slope']:.4f}")
+    
+    if st.session_state['has_results']:
+        try:
+            # 查找结果索引
+            idx = np.where(st.session_state['all_pipe_ids'] == pipe_id)[0]
+            if len(idx) == 0:
+                st.warning("该管道不在计算结果中")
+                return
+            idx = idx[0]
+
+            ts_Q = st.session_state['res_Q'][idx, :]
+            ts_v = st.session_state['res_v'][idx, :]
+            ts_h = st.session_state['res_h'][idx, :]
+            hours_arr = np.arange(sim_hours)
+            
+            avg_Q = np.mean(ts_Q)
+            avg_v = np.mean(ts_v)
+            avg_h = np.mean(ts_h)
+            
+            st.markdown("##### 📊 模拟统计 (平均值)")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("平均流量", f"{avg_Q:.4f} m³/s")
+            m2.metric("平均流速", f"{avg_v:.4f} m/s")
+            m3.metric("平均水深", f"{avg_h:.4f} m")
+            
+            st.markdown("##### 📉 过程线")
+            if PLOTLY_AVAILABLE:
+                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                                    subplot_titles=("流量 Q (m³/s)", "流速 v (m/s)", "水深 h (m)"))
+                line_style = dict(width=2)
+                fig.add_trace(go.Scatter(x=hours_arr, y=ts_Q, name="流量", line=dict(color='#3b82f6', **line_style), fill='tozeroy'), row=1, col=1)
+                fig.add_trace(go.Scatter(x=hours_arr, y=ts_v, name="流速", line=dict(color='#f97316', **line_style)), row=2, col=1)
+                fig.add_trace(go.Scatter(x=hours_arr, y=ts_h, name="水深", line=dict(color='#22c55e', **line_style), fill='tozeroy'), row=3, col=1)
                 
-                avg_Q = np.mean(ts_Q)
-                avg_v = np.mean(ts_v)
-                avg_h = np.mean(ts_h)
+                # 添加管顶红线
+                fig.add_hline(y=info['Diameter'], line_dash="dash", line_color="red", annotation_text="管顶", row=3, col=1)
                 
-                st.markdown("##### 📊 模拟统计 (平均值)")
-                m1, m2, m3 = st.columns(3)
-                m1.metric("平均流量", f"{avg_Q:.4f} m³/s")
-                m2.metric("平均流速", f"{avg_v:.4f} m/s")
-                m3.metric("平均水深", f"{avg_h:.4f} m")
-                
-                st.markdown("##### 📉 过程线")
-                if PLOTLY_AVAILABLE:
-                    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-                                        subplot_titles=("流量 Q (m³/s)", "流速 v (m/s)", "水深 h (m)"))
-                    line_style = dict(width=2)
-                    fig.add_trace(go.Scatter(x=hours_arr, y=ts_Q, name="流量", line=dict(color='#3b82f6', **line_style), fill='tozeroy'), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=hours_arr, y=ts_v, name="流速", line=dict(color='#f97316', **line_style)), row=2, col=1)
-                    fig.add_trace(go.Scatter(x=hours_arr, y=ts_h, name="水深", line=dict(color='#22c55e', **line_style), fill='tozeroy'), row=3, col=1)
-                    fig.add_hline(y=info['Diameter'], line_dash="dash", line_color="red", row=3, col=1)
-                    fig.update_layout(height=500, margin=dict(t=20, b=0, l=0, r=0), showlegend=False, hovermode="x unified")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.line_chart(pd.DataFrame({'Q': ts_Q, 'v': ts_v, 'h': ts_h}))
-            except Exception as e:
-                st.error(f"数据索引错误: {e}")
-        else:
-            st.info("请先运行模拟以查看结果")
+                fig.update_layout(height=600, margin=dict(t=20, b=0, l=0, r=0), showlegend=False, hovermode="x unified")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.line_chart(pd.DataFrame({'Q': ts_Q, 'v': ts_v, 'h': ts_h}))
+        except Exception as e:
+            st.error(f"读取结果出错: {e}")
     else:
-        st.error("未找到该管道信息")
+        st.info("⚠️ 尚未运行模拟，暂无水力结果。请点击左侧“开始模拟计算”。")
 
 # ==========================================
 # 5. 界面主逻辑
@@ -358,50 +374,72 @@ if uploaded_file and not error_msg:
     
     df_map = df_pipe.copy()
     if has_coords:
+        # 坐标转换
         df_map, trans_status = convert_coordinates(df_map)
-        df_map = df_map.reset_index(drop=True)
+        df_map = df_map.reset_index(drop=True) # 重置索引以匹配点击事件
         
         if trans_status == "HK80":
             x_us, y_us, x_ds, y_ds = 'US_X_WGS84', 'US_Y_WGS84', 'DS_X_WGS84', 'DS_Y_WGS84'
         else:
             x_us, y_us, x_ds, y_ds = 'US_X', 'US_Y', 'DS_X', 'DS_Y'
 
+        # 样式计算
         d_min, d_max = df_map['Diameter'].min(), df_map['Diameter'].max()
-        current_selected_id = str(st.session_state.get('selected_pipe_id', ''))
 
         def get_style(row):
             d = row['Diameter']
-            pid = str(row['PipeID'])
             if d_max == d_min: ratio = 0.5
             else: ratio = (d - d_min) / (d_max - d_min)
             
-            if pid == current_selected_id:
-                color = [255, 0, 0, 255]
-                width = max(3, d * 5) * 3
-            else:
-                color = [int(0 + 100*ratio), int(100 + 155*ratio), 255, 200]
-                width = max(2, d * 5)
+            # 颜色：浅蓝 -> 深蓝
+            color = [int(0 + 100*ratio), int(100 + 155*ratio), 255, 200]
+            # 宽度
+            width = max(2, d * 5)
             return pd.Series([color, width])
 
         df_map[['color', 'width']] = df_map.apply(get_style, axis=1)
 
-        # 计算箭头数据
-        def calculate_arrow(row):
-            start_x, start_y = row[x_us], row[y_us]
-            end_x, end_y = row[x_ds], row[y_ds]
-            mid_x = (start_x + end_x) / 2
-            mid_y = (start_y + end_y) / 2
-            angle = math.degrees(math.atan2(end_y - start_y, end_x - start_x))
-            # 调整角度以适应 IconLayer (pydeck 默认旋转方向可能需要调整，通常0度是正北或正东，这里使用 -angle)
-            return pd.Series([mid_x, mid_y, -angle])
+        # --- 箭头几何计算 (PolygonLayer) ---
+        def get_arrow_polygon(row):
+            """计算位于管道中点的三角形箭头顶点"""
+            sx, sy = row[x_us], row[y_us]
+            ex, ey = row[x_ds], row[y_ds]
+            
+            # 中点
+            mx, my = (sx + ex) / 2, (sy + ey) / 2
+            
+            # 向量
+            dx = ex - sx
+            dy = ey - sy
+            length = math.sqrt(dx*dx + dy*dy)
+            
+            if length == 0: return []
+            
+            # 单位向量
+            ux, uy = dx/length, dy/length
+            # 垂直单位向量 (旋转90度: -y, x)
+            vx, vy = -uy, ux
+            
+            # 箭头尺寸 (经纬度单位，约等于15-20米，根据需要调整)
+            # 0.00015 度大约是 15米
+            scale = 0.00015 
+            
+            # 顶点1: 箭头尖端 (沿管道方向向前)
+            p1 = [mx + ux * scale * 1.5, my + uy * scale * 1.5]
+            # 顶点2: 左翼 (向后并向左)
+            p2 = [mx - ux * scale + vx * scale * 0.8, my - uy * scale + vy * scale * 0.8]
+            # 顶点3: 右翼 (向后并向右)
+            p3 = [mx - ux * scale - vx * scale * 0.8, my - uy * scale - vy * scale * 0.8]
+            
+            return [p1, p2, p3]
 
-        df_map[['mid_x', 'mid_y', 'angle']] = df_map.apply(calculate_arrow, axis=1)
+        df_map['arrow_polygon'] = df_map.apply(get_arrow_polygon, axis=1)
 
         mid_lat = (df_map[y_us].mean() + df_map[y_ds].mean()) / 2
         mid_lon = (df_map[x_us].mean() + df_map[x_ds].mean()) / 2
         view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=13, pitch=0)
 
-        # 管道层
+        # 1. 管道线条层 (可点击)
         line_layer = pdk.Layer(
             "LineLayer",
             df_map,
@@ -410,48 +448,18 @@ if uploaded_file and not error_msg:
             get_color="color",
             get_width="width",
             width_min_pixels=2,
-            pickable=True,
+            pickable=True,  # 关键：只有这个层开启点击
             auto_highlight=True,
             highlight_color=[255, 255, 0, 255],
         )
 
-        # 箭头图标 (Base64)
-        ARROW_ICON_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAAJUlEQVR42mP8/5+hngEAmIiDy///DAwMjDABRg0cNXDQwOAzEAAAuB4T6XQ8sV8AAAAASUVORK5CYII="
-        # 上面是一个简单的白色方块/点，为了更好的箭头效果，我们使用PathLayer画箭头，或者使用更复杂的Icon
-        # 由于无法引用外部URL，使用简单的PolygonLayer绘制三角形箭头更稳健
-        
-        def get_arrow_polygon(row):
-            # 简单的平面几何计算三角形顶点
-            sx, sy = row[x_us], row[y_us]
-            ex, ey = row[x_ds], row[y_ds]
-            mx, my = (sx+ex)/2, (sy+ey)/2
-            
-            dx = ex - sx
-            dy = ey - sy
-            length = math.sqrt(dx*dx + dy*dy)
-            if length == 0: return []
-            
-            ux, uy = dx/length, dy/length
-            vx, vy = -uy, ux
-            
-            # 箭头大小系数 (度)
-            scale = 0.00015 
-            
-            # 顶点: 尖端，左翼，右翼
-            p1 = [mx + ux*scale*2, my + uy*scale*2]
-            p2 = [mx - ux*scale + vx*scale, my - uy*scale + vy*scale]
-            p3 = [mx - ux*scale - vx*scale, my - uy*scale - vy*scale]
-            
-            return [p1, p2, p3]
-
-        df_map['arrow_polygon'] = df_map.apply(get_arrow_polygon, axis=1)
-
+        # 2. 箭头层 (不可点击，仅展示)
         arrow_layer = pdk.Layer(
             "PolygonLayer",
             df_map,
             get_polygon="arrow_polygon",
-            get_fill_color=[255, 255, 255, 200],
-            pickable=False,
+            get_fill_color=[255, 255, 255, 200], # 白色半透明箭头
+            pickable=False, # 关键：防止点击箭头导致索引错位
             stroked=False
         )
 
@@ -462,25 +470,28 @@ if uploaded_file and not error_msg:
             tooltip={"html": "<b>ID:</b> {PipeID}<br/><b>管径:</b> {Diameter}m"}
         )
         
-        selection = st.pydeck_chart(
+        # 渲染地图并捕获交互事件
+        event = st.pydeck_chart(
             deck, 
-            on_select="rerun",
+            on_select="rerun", # 点击后触发重运行
             selection_mode="single-object",
             use_container_width=True
         )
         
-        if selection.selection:
-            indices = selection.selection.get("indices")
+        # --- 处理点击事件 ---
+        if event.selection:
+            indices = event.selection.get("indices")
+            # 确保有选中且选中的是LineLayer (虽然我们只让LineLayer pickable，但安全起见)
             if indices:
                 clicked_idx = indices[0]
-                clicked_id = df_map.iloc[clicked_idx]['PipeID']
-                st.session_state['selected_pipe_id'] = clicked_id
-                st.session_state['show_dialog'] = True
-
-        if st.session_state.get('show_dialog') and st.session_state['selected_pipe_id']:
-             show_pipe_details(st.session_state['selected_pipe_id'], df_pipe, sim_hours)
-             # 重置状态防止死循环，但st.dialog本身是模态的，关闭后会刷新
-             st.session_state['show_dialog'] = False
+                # 从原始 DataFrame 获取 ID
+                selected_pipe_id = df_map.iloc[clicked_idx]['PipeID']
+                
+                # 更新 Session State (可选，用于其他逻辑)
+                st.session_state['selected_pipe_id'] = selected_pipe_id
+                
+                # 直接调用弹窗函数
+                show_pipe_details(selected_pipe_id, df_pipe, sim_hours)
 
     else:
         st.info("无坐标数据，无法显示地图。")
