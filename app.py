@@ -3,7 +3,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import networkx as nx
-import matplotlib.pyplot as plt
 import pydeck as pdk
 import warnings
 import time
@@ -29,17 +28,13 @@ st.set_page_config(page_title="城市雨水管网水力模拟系统", layout="wi
 # ==========================================
 # 0. 初始化 Session State
 # ==========================================
-# 我们需要两个状态：
-# 1. selected_pipe_id: 存储当前选中的真实 PipeID
-# 2. pipe_selector: 绑定到下拉框的 key，用于强制更新 UI
 if 'selected_pipe_id' not in st.session_state:
     st.session_state['selected_pipe_id'] = None
+if 'pipe_selector' not in st.session_state:
+    st.session_state['pipe_selector'] = None
 
 # 忽略警告
 warnings.filterwarnings('ignore')
-plt.style.use('seaborn-v0_8-whitegrid')
-plt.rcParams['font.sans-serif'] = ['SimHei']
-plt.rcParams['axes.unicode_minus'] = False
 
 # ==========================================
 # 1. 核心水力计算类 (保持不变)
@@ -136,7 +131,6 @@ def load_data(uploaded_file):
     if 'Manning' not in df.columns:
         df['Manning'] = 0.013
     
-    # 确保 PipeID 是字符串
     df['PipeID'] = df['PipeID'].astype(str)
         
     return df, None, has_coords
@@ -145,7 +139,6 @@ def convert_coordinates(df):
     if not PYPROJ_AVAILABLE:
         return df, "未安装 pyproj 库，无法进行坐标转换。"
     
-    # 简单的判断：如果坐标很小，可能已经是经纬度
     if df['US_X'].mean() < 180:
         return df, None 
 
@@ -192,8 +185,8 @@ def generate_inflows(nodes, hours=24):
 # 3. Streamlit 界面逻辑
 # ==========================================
 
-st.title("🌊 城市雨水管网水力分析系统 (Web版)")
-st.markdown("支持香港1980坐标系 (HK80) 自动转换为地图经纬度。**点击地图上的管段可查看详情。**")
+st.title("🌊 城市雨水管网水力分析系统")
+st.markdown("👉 **鼠标悬停**在管道上可高亮显示；**点击**管道可在右侧查看详细水力曲线。")
 
 # --- 侧边栏 ---
 st.sidebar.header("1. 数据导入")
@@ -272,14 +265,14 @@ if uploaded_file:
             
         G, cycles = build_graph(df_pipe)
         
-        # 布局：左侧地图，右侧/下方详情
-        col_map, col_details = st.columns([1.5, 1])
+        # 布局：左侧地图，右侧详情
+        col_map, col_details = st.columns([1.6, 1])
         
-        # 准备地图数据（放在列外面，因为后续逻辑需要用到 df_map）
+        # 准备地图数据
         df_map = df_pipe.copy()
         if has_coords:
             df_map, trans_status = convert_coordinates(df_map)
-            # ★★★ 关键修复：重置索引，确保 pydeck 返回的 index 能对应上 ★★★
+            # ★★★ 关键：重置索引，确保 pydeck 返回的 index 能对应上 ★★★
             df_map = df_map.reset_index(drop=True)
             
             if trans_status == "HK80":
@@ -289,30 +282,34 @@ if uploaded_file:
                 x_col_us, y_col_us = 'US_X', 'US_Y'
                 x_col_ds, y_col_ds = 'DS_X', 'DS_Y'
 
+            # 颜色映射
             d_min, d_max = df_map['Diameter'].min(), df_map['Diameter'].max()
             def get_color(d):
                 if d_max == d_min: ratio = 0.5
                 else: ratio = (d - d_min) / (d_max - d_min)
-                r = int(255 * ratio)
-                g = int(255 * (1 - ratio))
-                return [r, g, 0, 200]
+                r = int(50 + 205 * ratio)
+                g = int(50 + 205 * (1 - ratio))
+                return [r, g, 200] # 基础颜色
+            
             df_map['color'] = df_map['Diameter'].apply(get_color)
 
         with col_map:
-            st.subheader("🗺️ GIS 管网交互地图")
+            st.subheader("🗺️ 交互地图 (点击选择)")
             if has_coords:
                 mid_lat = (df_map[y_col_us].mean() + df_map[y_col_ds].mean()) / 2
                 mid_lon = (df_map[x_col_us].mean() + df_map[x_col_ds].mean()) / 2
 
+                # ★★★ 核心修改：增强交互体验 ★★★
                 layer = pdk.Layer(
                     "LineLayer",
-                    df_map, # 这里传入的是已经 reset_index 的数据
+                    df_map,
                     get_source_position=[x_col_us, y_col_us],
                     get_target_position=[x_col_ds, y_col_ds],
                     get_color="color",
-                    get_width=5,
-                    pickable=True,
-                    auto_highlight=True,
+                    get_width=8,  # 加粗线条，方便鼠标悬停
+                    pickable=True, # 允许交互（悬停和点击）
+                    auto_highlight=True, # 开启自动高亮
+                    highlight_color=[255, 255, 0, 255], # 悬停时显示亮黄色
                 )
 
                 view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=13, pitch=0)
@@ -321,10 +318,14 @@ if uploaded_file:
                     layers=[layer],
                     initial_view_state=view_state,
                     map_style='mapbox://styles/mapbox/dark-v10',
-                    tooltip={"text": "点击查看详情\nID: {PipeID}"}
+                    # 悬停时显示的提示框
+                    tooltip={
+                        "html": "<b>Pipe ID:</b> {PipeID}<br/><b>管径:</b> {Diameter}m<br/><b>点击查看详情</b>",
+                        "style": {"backgroundColor": "steelblue", "color": "white"}
+                    }
                 )
                 
-                # 渲染地图
+                # 渲染地图，监听点击事件
                 selection = st.pydeck_chart(
                     deck, 
                     on_select="rerun", 
@@ -332,77 +333,67 @@ if uploaded_file:
                     use_container_width=True
                 )
                 
-                # ★★★ 关键修复：处理点击逻辑 ★★★
+                # 处理点击逻辑
                 if selection.selection:
                     indices = selection.selection.get("indices")
                     if indices:
                         clicked_index = indices[0]
-                        # 使用 reset_index 后的 df_map 获取 ID
                         clicked_pipe_id = df_map.iloc[clicked_index]['PipeID']
                         
-                        # 如果点击了新的管段，更新 session state 并强制刷新
                         if clicked_pipe_id != st.session_state['selected_pipe_id']:
                             st.session_state['selected_pipe_id'] = clicked_pipe_id
-                            # 同时更新下拉框的 key，确保 UI 同步
                             st.session_state['pipe_selector'] = clicked_pipe_id
                             st.rerun()
             else:
                 st.warning("无坐标数据，无法显示地图")
 
         with col_details:
-            st.subheader("📊 模拟与分析")
+            st.subheader("📈 管段详情与曲线")
             
-            # 1. 模拟控制
+            # 模拟控制按钮
             if not st.session_state.get('has_results', False):
-                st.info("尚未运行模拟。点击下方按钮开始计算。")
+                st.info("请先点击下方按钮进行水力计算")
                 if st.button("🚀 开始模拟计算", type="primary"):
                     run_simulation(G, df_pipe, sim_hours)
                     st.rerun()
             else:
-                if st.button("🔄 重新运行模拟"):
+                if st.button("🔄 重新计算"):
                     run_simulation(G, df_pipe, sim_hours)
                     st.rerun()
 
             st.divider()
 
-            # 2. 结果展示
-            # 如果还没有选中任何管段，默认选第一个
+            # 默认选中逻辑
             if st.session_state['selected_pipe_id'] is None and len(df_pipe) > 0:
                 first_id = df_pipe.iloc[0]['PipeID']
                 st.session_state['selected_pipe_id'] = first_id
-                # 初始化下拉框的 key
-                if 'pipe_selector' not in st.session_state:
+                if 'pipe_selector' not in st.session_state or st.session_state['pipe_selector'] is None:
                     st.session_state['pipe_selector'] = first_id
 
+            # 下拉框同步
             all_ids = df_pipe['PipeID'].values.tolist()
-            
-            # 回调函数：当用户手动改变下拉框时触发
             def on_pipe_select_change():
                 st.session_state['selected_pipe_id'] = st.session_state['pipe_selector']
 
-            # 下拉框
-            # key='pipe_selector' 绑定了 session_state 中的值
-            # 当地图点击更新了 session_state['pipe_selector'] 后，这个下拉框会自动跳到对应的值
             selected_pipe = st.selectbox(
-                "当前选中管段:", 
+                "当前选中管段 (也可在地图点击):", 
                 all_ids, 
                 key="pipe_selector",
                 on_change=on_pipe_select_change
             )
             
-            # 确保 selected_pipe_id 与下拉框保持一致 (双重保险)
             current_pipe_id = selected_pipe
 
-            # 展示选中管段的静态属性
+            # 显示静态属性
             pipe_row = df_pipe[df_pipe['PipeID'] == current_pipe_id]
             if not pipe_row.empty:
                 pipe_info = pipe_row.iloc[0]
                 c1, c2, c3 = st.columns(3)
-                c1.metric("管径", f"{pipe_info['Diameter']} m")
-                c2.metric("长度", f"{pipe_info['Length']} m")
-                c3.metric("坡度", f"{pipe_info['Slope']:.4f}")
+                c1.metric("管径 (D)", f"{pipe_info['Diameter']} m")
+                c2.metric("管长 (L)", f"{pipe_info['Length']} m")
+                c3.metric("坡度 (S)", f"{pipe_info['Slope']:.4f}")
 
-                # 展示动态结果
+                # 显示动态曲线
                 if st.session_state.get('has_results', False):
                     try:
                         idx = np.where(st.session_state['all_pipe_ids'] == current_pipe_id)[0][0]
@@ -412,28 +403,52 @@ if uploaded_file:
                         hours_arr = np.arange(sim_hours)
                         
                         if PLOTLY_AVAILABLE:
-                            fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                                                vertical_spacing=0.05,
-                                                subplot_titles=("流量 Q (m³/s)", "流速 v (m/s)", "水深 h (m)"))
-                            fig.add_trace(go.Scatter(x=hours_arr, y=ts_Q, name="流量", line=dict(color='#3b82f6')), row=1, col=1)
-                            fig.add_trace(go.Scatter(x=hours_arr, y=ts_v, name="流速", line=dict(color='#f97316')), row=2, col=1)
-                            fig.add_trace(go.Scatter(x=hours_arr, y=ts_h, name="水深", line=dict(color='#22c55e'), fill='tozeroy'), row=3, col=1)
-                            fig.add_hline(y=pipe_info['Diameter'], line_dash="dash", line_color="red", annotation_text="管顶", row=3, col=1)
-                            fig.update_layout(height=500, margin=dict(l=0, r=0, t=20, b=0), showlegend=False)
+                            # 创建三个子图
+                            fig = make_subplots(
+                                rows=3, cols=1, 
+                                shared_xaxes=True, 
+                                vertical_spacing=0.08,
+                                subplot_titles=("流量 Q (m³/s)", "流速 v (m/s)", "水深 h (m)")
+                            )
+                            
+                            # 1. 流量
+                            fig.add_trace(go.Scatter(
+                                x=hours_arr, y=ts_Q, mode='lines', name="流量",
+                                line=dict(color='#3b82f6', width=2), fill='tozeroy', fillcolor='rgba(59, 130, 246, 0.1)'
+                            ), row=1, col=1)
+                            
+                            # 2. 流速
+                            fig.add_trace(go.Scatter(
+                                x=hours_arr, y=ts_v, mode='lines', name="流速",
+                                line=dict(color='#f97316', width=2)
+                            ), row=2, col=1)
+                            
+                            # 3. 水深
+                            fig.add_trace(go.Scatter(
+                                x=hours_arr, y=ts_h, mode='lines', name="水深",
+                                line=dict(color='#22c55e', width=2), fill='tozeroy', fillcolor='rgba(34, 197, 94, 0.2)'
+                            ), row=3, col=1)
+                            
+                            # 添加管顶警戒线
+                            fig.add_hline(y=pipe_info['Diameter'], line_dash="dash", line_color="red", 
+                                          annotation_text="管顶", row=3, col=1)
+
+                            fig.update_layout(
+                                height=600, 
+                                margin=dict(l=10, r=10, t=30, b=10), 
+                                showlegend=False,
+                                hovermode="x unified"
+                            )
                             st.plotly_chart(fig, use_container_width=True)
                         else:
+                            st.warning("未检测到 Plotly 库，使用基础图表展示")
                             st.line_chart(pd.DataFrame({'Q': ts_Q, 'v': ts_v, 'h': ts_h}))
                     except IndexError:
-                        st.error("未找到该管段的模拟结果，请重新运行模拟。")
+                        st.error("结果索引错误，请重新运行模拟。")
                 else:
-                    st.info("👆 请先点击上方的“开始模拟计算”按钮查看水力结果。")
+                    st.info("👆 数据已就绪，请点击“开始模拟计算”查看曲线。")
             else:
                 st.error("数据中找不到该管段ID")
 
 else:
     st.info("请在左侧上传数据文件。")
-    st.markdown("""
-    **文件列名说明（不区分大小写）：**
-    - 坐标：`us_x`, `us_y` (上游); `ds_x`, `ds_y` (下游)
-    - 属性：`PipeID`, `Diameter`, `Slope`, `Length`
-    """)
