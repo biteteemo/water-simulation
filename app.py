@@ -254,12 +254,11 @@ def run_simulation_logic(G, df_pipe, hours):
     }
 
 # ==========================================
-# 4. 弹窗显示逻辑 (重要修改)
+# 4. 详情显示组件 (修改为普通函数)
 # ==========================================
-@st.dialog("管道详情", width="large")
-def show_pipe_details(pipe_id, df_pipe, sim_hours):
+def render_pipe_details(pipe_id, df_pipe, sim_hours):
     """
-    显示管道详情的弹窗函数
+    在当前容器中渲染管道详情
     """
     pipe_row = df_pipe[df_pipe['PipeID'] == pipe_id]
     
@@ -269,13 +268,17 @@ def show_pipe_details(pipe_id, df_pipe, sim_hours):
 
     info = pipe_row.iloc[0]
     
-    st.markdown(f"### 📍 管道 ID: {pipe_id}")
+    st.markdown(f"### 📍 管道: {pipe_id}")
+    st.divider()
     
-    st.markdown("##### 📌 基础属性")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("管径 (Diameter)", f"{info['Diameter']} m")
-    c2.metric("管长 (Length)", f"{info['Length']} m")
-    c3.metric("坡度 (Slope)", f"{info['Slope']:.4f}")
+    st.markdown("#### 📌 基础属性")
+    c1, c2 = st.columns(2)
+    c1.metric("管径", f"{info['Diameter']} m")
+    c2.metric("管长", f"{info['Length']} m")
+    c1.metric("坡度", f"{info['Slope']:.4f}")
+    c2.metric("曼宁", f"{info['Manning']}")
+    
+    st.divider()
     
     if st.session_state['has_results']:
         try:
@@ -295,32 +298,32 @@ def show_pipe_details(pipe_id, df_pipe, sim_hours):
             avg_v = np.mean(ts_v)
             avg_h = np.mean(ts_h)
             
-            st.markdown("##### 📊 模拟统计 (平均值)")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("平均流量", f"{avg_Q:.4f} m³/s")
-            m2.metric("平均流速", f"{avg_v:.4f} m/s")
-            m3.metric("平均水深", f"{avg_h:.4f} m")
+            st.markdown("#### 📊 模拟统计 (平均值)")
+            m1, m2 = st.columns(2)
+            m1.metric("流量", f"{avg_Q:.4f} m³/s")
+            m2.metric("流速", f"{avg_v:.4f} m/s")
+            m1.metric("水深", f"{avg_h:.4f} m")
             
-            st.markdown("##### 📉 过程线")
+            st.markdown("#### 📉 过程线")
             if PLOTLY_AVAILABLE:
-                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-                                    subplot_titles=("流量 Q (m³/s)", "流速 v (m/s)", "水深 h (m)"))
+                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+                                    subplot_titles=("流量 Q", "流速 v", "水深 h"))
                 line_style = dict(width=2)
                 fig.add_trace(go.Scatter(x=hours_arr, y=ts_Q, name="流量", line=dict(color='#3b82f6', **line_style), fill='tozeroy'), row=1, col=1)
                 fig.add_trace(go.Scatter(x=hours_arr, y=ts_v, name="流速", line=dict(color='#f97316', **line_style)), row=2, col=1)
                 fig.add_trace(go.Scatter(x=hours_arr, y=ts_h, name="水深", line=dict(color='#22c55e', **line_style), fill='tozeroy'), row=3, col=1)
                 
                 # 添加管顶红线
-                fig.add_hline(y=info['Diameter'], line_dash="dash", line_color="red", annotation_text="管顶", row=3, col=1)
+                fig.add_hline(y=info['Diameter'], line_dash="dash", line_color="red", row=3, col=1)
                 
-                fig.update_layout(height=600, margin=dict(t=20, b=0, l=0, r=0), showlegend=False, hovermode="x unified")
+                fig.update_layout(height=500, margin=dict(t=20, b=0, l=0, r=0), showlegend=False, hovermode="x unified")
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.line_chart(pd.DataFrame({'Q': ts_Q, 'v': ts_v, 'h': ts_h}))
         except Exception as e:
             st.error(f"读取结果出错: {e}")
     else:
-        st.info("⚠️ 尚未运行模拟，暂无水力结果。请点击左侧“开始模拟计算”。")
+        st.info("⚠️ 暂无水力结果，请先运行模拟。")
 
 # ==========================================
 # 5. 界面主逻辑
@@ -369,132 +372,173 @@ with st.sidebar:
                     st.rerun()
 
 if uploaded_file and not error_msg:
-    # --- 地图区域 ---
-    st.subheader("🗺️ 管网地图 (点击管道查看详情)")
+    # 使用列布局：左侧地图，右侧详情
+    col_map_area, col_details_area = st.columns([7, 3])
     
-    df_map = df_pipe.copy()
-    if has_coords:
-        # 坐标转换
-        df_map, trans_status = convert_coordinates(df_map)
-        df_map = df_map.reset_index(drop=True) # 重置索引以匹配点击事件
+    with col_map_area:
+        # --- 地图控制栏 ---
+        c_ctrl1, c_ctrl2, c_spacer = st.columns([2, 2, 6])
+        show_arrows = c_ctrl1.toggle("显示流向箭头", value=False)
+        show_nodes = c_ctrl2.toggle("显示进水节点", value=False)
         
-        if trans_status == "HK80":
-            x_us, y_us, x_ds, y_ds = 'US_X_WGS84', 'US_Y_WGS84', 'DS_X_WGS84', 'DS_Y_WGS84'
+        df_map = df_pipe.copy()
+        if has_coords:
+            # 坐标转换
+            df_map, trans_status = convert_coordinates(df_map)
+            df_map = df_map.reset_index(drop=True) 
+            
+            if trans_status == "HK80":
+                x_us, y_us, x_ds, y_ds = 'US_X_WGS84', 'US_Y_WGS84', 'DS_X_WGS84', 'DS_Y_WGS84'
+            else:
+                x_us, y_us, x_ds, y_ds = 'US_X', 'US_Y', 'DS_X', 'DS_Y'
+
+            # 样式计算
+            d_min, d_max = df_map['Diameter'].min(), df_map['Diameter'].max()
+
+            def get_style(row):
+                d = row['Diameter']
+                if d_max == d_min: ratio = 0.5
+                else: ratio = (d - d_min) / (d_max - d_min)
+                color = [int(0 + 100*ratio), int(100 + 155*ratio), 255, 200]
+                width = max(2, d * 5)
+                return pd.Series([color, width])
+
+            df_map[['color', 'width']] = df_map.apply(get_style, axis=1)
+
+            # --- 箭头几何计算 (PolygonLayer) ---
+            def get_arrow_polygon(row):
+                sx, sy = row[x_us], row[y_us]
+                ex, ey = row[x_ds], row[y_ds]
+                mx, my = (sx + ex) / 2, (sy + ey) / 2
+                dx = ex - sx
+                dy = ey - sy
+                length = math.sqrt(dx*dx + dy*dy)
+                if length == 0: return []
+                ux, uy = dx/length, dy/length
+                vx, vy = -uy, ux
+                
+                # 调整后的箭头尺寸 (更小)
+                scale = 0.00006  # 之前是 0.00015
+                
+                p1 = [mx + ux * scale * 1.5, my + uy * scale * 1.5]
+                p2 = [mx - ux * scale + vx * scale * 0.8, my - uy * scale + vy * scale * 0.8]
+                p3 = [mx - ux * scale - vx * scale * 0.8, my - uy * scale - vy * scale * 0.8]
+                return [p1, p2, p3]
+
+            df_map['arrow_polygon'] = df_map.apply(get_arrow_polygon, axis=1)
+
+            mid_lat = (df_map[y_us].mean() + df_map[y_ds].mean()) / 2
+            mid_lon = (df_map[x_us].mean() + df_map[x_ds].mean()) / 2
+            view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=13, pitch=0)
+
+            layers_list = []
+
+            # 1. 管道线条层 (始终显示)
+            line_layer = pdk.Layer(
+                "LineLayer",
+                df_map,
+                get_source_position=[x_us, y_us],
+                get_target_position=[x_ds, y_ds],
+                get_color="color",
+                get_width="width",
+                width_min_pixels=2,
+                pickable=True,
+                auto_highlight=True,
+                highlight_color=[255, 255, 0, 255],
+            )
+            layers_list.append(line_layer)
+
+            # 2. 箭头层 (根据开关显示)
+            if show_arrows:
+                arrow_layer = pdk.Layer(
+                    "PolygonLayer",
+                    df_map,
+                    get_polygon="arrow_polygon",
+                    get_fill_color=[255, 255, 255, 200],
+                    pickable=False,
+                    stroked=False
+                )
+                layers_list.append(arrow_layer)
+            
+            # 3. 节点层 (根据开关显示)
+            if show_nodes:
+                # 提取唯一的上游节点作为进水节点
+                nodes_df = df_map.groupby('UpstreamNode').agg({
+                    x_us: 'first',
+                    y_us: 'first'
+                }).reset_index()
+                
+                node_layer = pdk.Layer(
+                    "ScatterplotLayer",
+                    nodes_df,
+                    get_position=[x_us, y_us],
+                    get_radius=10, # 米
+                    get_fill_color=[255, 0, 0, 200], # 红色
+                    pickable=True,
+                    auto_highlight=True
+                )
+                layers_list.append(node_layer)
+
+            deck = pdk.Deck(
+                layers=layers_list,
+                initial_view_state=view_state,
+                map_style='mapbox://styles/mapbox/dark-v10',
+                tooltip={
+                    "html": "<b>ID:</b> {PipeID}<br/><b>管径:</b> {Diameter}m<br/><b>节点:</b> {UpstreamNode}"
+                }
+            )
+            
+            # 渲染地图
+            event = st.pydeck_chart(
+                deck, 
+                on_select="rerun", 
+                selection_mode="single-object",
+                use_container_width=True,
+                height=600
+            )
+            
+            # 处理选择逻辑
+            if event.selection:
+                indices = event.selection.get("indices")
+                # 确保选中的是 LineLayer (索引对应 df_map)
+                # 注意：如果点击的是 ScatterplotLayer (节点)，indices 也会有值，但对应的是 nodes_df
+                # 这里我们简单处理：如果点击了对象，且该对象看起来像管道（有PipeID），则更新状态
+                # 由于 PyDeck 的 selection 返回比较通用，这里主要针对管道点击优化
+                
+                # 只有当点击的是 LineLayer 时，我们才更新管道详情
+                # 我们可以通过判断 layerId 或者简单的假设：管道数量通常远大于节点，或者通过业务逻辑判断
+                # 简单起见，我们假设用户主要点击管道。
+                if indices:
+                    # 尝试从 df_map 获取
+                    try:
+                        idx = indices[0]
+                        # 这是一个简化的假设，假设点击的是第一个层(LineLayer)的数据
+                        # 如果点击的是节点层，索引可能越界或指向错误数据，这里做个简单保护
+                        if idx < len(df_map):
+                             # 检查是否点击的是节点层 (PyDeck selection info 不太容易区分层)
+                             # 但因为我们主要关注管道详情，这里直接取 df_map
+                             selected_id = df_map.iloc[idx]['PipeID']
+                             st.session_state['selected_pipe_id'] = selected_id
+                    except:
+                        pass
+
         else:
-            x_us, y_us, x_ds, y_ds = 'US_X', 'US_Y', 'DS_X', 'DS_Y'
+            st.info("无坐标数据，无法显示地图。")
 
-        # 样式计算
-        d_min, d_max = df_map['Diameter'].min(), df_map['Diameter'].max()
+    with col_details_area:
+        st.subheader("📋 详细信息")
+        if st.session_state['selected_pipe_id']:
+            render_pipe_details(st.session_state['selected_pipe_id'], df_pipe, sim_hours)
+        else:
+            st.info("👈 请在左侧地图中点击任意管道查看详情。")
+            st.markdown("""
+            **操作提示：**
+            1. 缩放地图查看管网细节。
+            2. 点击 **显示流向箭头** 查看水流方向。
+            3. 点击 **显示进水节点** 查看进水口位置。
+            4. 选中管道后，此处将显示水力模拟结果。
+            """)
 
-        def get_style(row):
-            d = row['Diameter']
-            if d_max == d_min: ratio = 0.5
-            else: ratio = (d - d_min) / (d_max - d_min)
-            
-            # 颜色：浅蓝 -> 深蓝
-            color = [int(0 + 100*ratio), int(100 + 155*ratio), 255, 200]
-            # 宽度
-            width = max(2, d * 5)
-            return pd.Series([color, width])
-
-        df_map[['color', 'width']] = df_map.apply(get_style, axis=1)
-
-        # --- 箭头几何计算 (PolygonLayer) ---
-        def get_arrow_polygon(row):
-            """计算位于管道中点的三角形箭头顶点"""
-            sx, sy = row[x_us], row[y_us]
-            ex, ey = row[x_ds], row[y_ds]
-            
-            # 中点
-            mx, my = (sx + ex) / 2, (sy + ey) / 2
-            
-            # 向量
-            dx = ex - sx
-            dy = ey - sy
-            length = math.sqrt(dx*dx + dy*dy)
-            
-            if length == 0: return []
-            
-            # 单位向量
-            ux, uy = dx/length, dy/length
-            # 垂直单位向量 (旋转90度: -y, x)
-            vx, vy = -uy, ux
-            
-            # 箭头尺寸 (经纬度单位，约等于15-20米，根据需要调整)
-            # 0.00015 度大约是 15米
-            scale = 0.00015 
-            
-            # 顶点1: 箭头尖端 (沿管道方向向前)
-            p1 = [mx + ux * scale * 1.5, my + uy * scale * 1.5]
-            # 顶点2: 左翼 (向后并向左)
-            p2 = [mx - ux * scale + vx * scale * 0.8, my - uy * scale + vy * scale * 0.8]
-            # 顶点3: 右翼 (向后并向右)
-            p3 = [mx - ux * scale - vx * scale * 0.8, my - uy * scale - vy * scale * 0.8]
-            
-            return [p1, p2, p3]
-
-        df_map['arrow_polygon'] = df_map.apply(get_arrow_polygon, axis=1)
-
-        mid_lat = (df_map[y_us].mean() + df_map[y_ds].mean()) / 2
-        mid_lon = (df_map[x_us].mean() + df_map[x_ds].mean()) / 2
-        view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=13, pitch=0)
-
-        # 1. 管道线条层 (可点击)
-        line_layer = pdk.Layer(
-            "LineLayer",
-            df_map,
-            get_source_position=[x_us, y_us],
-            get_target_position=[x_ds, y_ds],
-            get_color="color",
-            get_width="width",
-            width_min_pixels=2,
-            pickable=True,  # 关键：只有这个层开启点击
-            auto_highlight=True,
-            highlight_color=[255, 255, 0, 255],
-        )
-
-        # 2. 箭头层 (不可点击，仅展示)
-        arrow_layer = pdk.Layer(
-            "PolygonLayer",
-            df_map,
-            get_polygon="arrow_polygon",
-            get_fill_color=[255, 255, 255, 200], # 白色半透明箭头
-            pickable=False, # 关键：防止点击箭头导致索引错位
-            stroked=False
-        )
-
-        deck = pdk.Deck(
-            layers=[line_layer, arrow_layer],
-            initial_view_state=view_state,
-            map_style='mapbox://styles/mapbox/dark-v10',
-            tooltip={"html": "<b>ID:</b> {PipeID}<br/><b>管径:</b> {Diameter}m"}
-        )
-        
-        # 渲染地图并捕获交互事件
-        event = st.pydeck_chart(
-            deck, 
-            on_select="rerun", # 点击后触发重运行
-            selection_mode="single-object",
-            use_container_width=True
-        )
-        
-        # --- 处理点击事件 ---
-        if event.selection:
-            indices = event.selection.get("indices")
-            # 确保有选中且选中的是LineLayer (虽然我们只让LineLayer pickable，但安全起见)
-            if indices:
-                clicked_idx = indices[0]
-                # 从原始 DataFrame 获取 ID
-                selected_pipe_id = df_map.iloc[clicked_idx]['PipeID']
-                
-                # 更新 Session State (可选，用于其他逻辑)
-                st.session_state['selected_pipe_id'] = selected_pipe_id
-                
-                # 直接调用弹窗函数
-                show_pipe_details(selected_pipe_id, df_pipe, sim_hours)
-
-    else:
-        st.info("无坐标数据，无法显示地图。")
 else:
     if not uploaded_file:
         st.info("👈 请先在左侧侧边栏上传数据文件。")
