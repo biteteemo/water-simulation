@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import warnings
-import plotly.graph_objects as go # 新增 Plotly
+import plotly.graph_objects as go 
 
 # ==========================================
 # 0. 配置与初始化
@@ -171,7 +171,6 @@ def create_interactive_map(df_pipe):
     fig = go.Figure()
 
     # 1. 绘制管线 (背景层，不可点击或点击无反馈)
-    # 为了性能，使用 None 断开的方式绘制单条 Trace
     x_lines = []
     y_lines = []
     for _, row in df_pipe.iterrows():
@@ -204,7 +203,8 @@ def create_interactive_map(df_pipe):
         name='Pipe Select',
         text=df_pipe['PipeID'], # 悬停显示 PipeID
         hovertemplate='<b>Pipe: %{text}</b><extra></extra>',
-        customdata=df_pipe.index # 存储索引以便回调获取
+        # 这里的 customdata 非常重要，它将直接传递给回调
+        customdata=df_pipe.index 
     ))
 
     fig.update_layout(
@@ -214,7 +214,9 @@ def create_interactive_map(df_pipe):
         showlegend=False,
         hovermode='closest',
         margin=dict(l=0, r=0, t=40, b=0),
-        height=500
+        height=500,
+        # 锁定缩放比例，防止地图变形
+        yaxis=dict(scaleanchor="x", scaleratio=1)
     )
     return fig
 
@@ -372,17 +374,26 @@ if uploaded_file:
             st.subheader("🗺️ 管网地图")
             if 'US_X' in df_pipe.columns:
                 fig = create_interactive_map(df_pipe)
+                
                 # 关键：捕获选择事件
                 selection = st.plotly_chart(fig, on_select="rerun", selection_mode="points", use_container_width=True)
                 
-                # 解析选择
+                # 解析选择 (修复版)
                 selected_pipe_idx = None
                 if selection and selection['selection']['points']:
-                    # 获取被点击点的索引 (对应 df_pipe 的行号)
-                    point_info = selection['selection']['points'][0]
-                    # 只有点击了 curveNumber=2 (即 Pipe Select 层) 才有效
-                    if point_info['curveNumber'] == 2:
-                        selected_pipe_idx = point_info['pointIndex']
+                    # 获取被点击点的列表
+                    points = selection['selection']['points']
+                    # 遍历所有被点击的点
+                    for point in points:
+                        # 检查是否有 customdata，这是最可靠的标识
+                        if 'customdata' in point:
+                            selected_pipe_idx = point['customdata']
+                            break
+                        # 备用方案：如果只有 Pipe Select 层是 markers 模式，且有 pointIndex
+                        # 我们在绘图时只有 Pipe Select 层设置了 customdata，所以上面的判断通常足够
+                        # 如果没有 customdata，尝试直接读取 pointIndex，但需要确保不是点击了其他层
+                        # 由于其他层 hoverinfo='skip' 且 mode='lines' 或 'markers' (Nodes)，
+                        # 通常只有 Pipe Select 层会触发有效的 point selection
             else:
                 st.warning("缺少坐标数据，无法绘图")
 
@@ -390,66 +401,71 @@ if uploaded_file:
             st.subheader("📊 详细数据面板")
             
             if selected_pipe_idx is not None:
-                pipe_info = df_pipe.iloc[selected_pipe_idx]
-                pipe_id = pipe_info['PipeID']
-                st.info(f"当前选中管段: **{pipe_id}**")
-                
-                # 1. 基础属性
-                with st.expander("管段属性", expanded=False):
-                    st.json({
-                        "Length": f"{pipe_info['Length']} m",
-                        "Diameter": f"{pipe_info['Diameter']} m",
-                        "Slope": pipe_info['Slope'],
-                        "Upstream": pipe_info['UpstreamNode'],
-                        "Downstream": pipe_info['DownstreamNode']
-                    })
+                # 确保索引是整数
+                try:
+                    selected_pipe_idx = int(selected_pipe_idx)
+                    pipe_info = df_pipe.iloc[selected_pipe_idx]
+                    pipe_id = pipe_info['PipeID']
+                    st.info(f"当前选中管段: **{pipe_id}**")
+                    
+                    # 1. 基础属性
+                    with st.expander("管段属性", expanded=False):
+                        st.json({
+                            "Length": f"{pipe_info['Length']} m",
+                            "Diameter": f"{pipe_info['Diameter']} m",
+                            "Slope": pipe_info['Slope'],
+                            "Upstream": pipe_info['UpstreamNode'],
+                            "Downstream": pipe_info['DownstreamNode']
+                        })
 
-                # 2. 水力结果图表
-                if 'hyd_res' in st.session_state:
-                    hyd = st.session_state['hyd_res']
-                    ts = range(hyd['Q'].shape[1])
-                    
-                    fig_h, ax_h = plt.subplots(2, 1, figsize=(6, 5), sharex=True)
-                    
-                    # 流量与流速
-                    ax_h[0].plot(ts, hyd['Q'][selected_pipe_idx], 'b-', label='流量 Q')
-                    ax_h[0].set_ylabel("Q (m³/s)")
-                    ax_h[0].set_title("水力模拟结果")
-                    ax_h[0].grid(True, alpha=0.3)
-                    
-                    ax2 = ax_h[0].twinx()
-                    ax2.plot(ts, hyd['v'][selected_pipe_idx], 'orange', linestyle='--', label='流速 v')
-                    ax2.set_ylabel("v (m/s)")
-                    
-                    # 水深
-                    ax_h[1].plot(ts, hyd['h'][selected_pipe_idx], 'g-', label='水深 h')
-                    ax_h[1].axhline(pipe_info['Diameter'], color='r', linestyle=':', label='管顶')
-                    ax_h[1].set_ylabel("h (m)")
-                    ax_h[1].set_xlabel("时间 (h)")
-                    ax_h[1].legend()
-                    ax_h[1].grid(True, alpha=0.3)
-                    
-                    st.pyplot(fig_h)
-                else:
-                    st.info("暂无水力数据，请点击左侧运行模拟。")
+                    # 2. 水力结果图表
+                    if 'hyd_res' in st.session_state:
+                        hyd = st.session_state['hyd_res']
+                        ts = range(hyd['Q'].shape[1])
+                        
+                        fig_h, ax_h = plt.subplots(2, 1, figsize=(6, 5), sharex=True)
+                        
+                        # 流量与流速
+                        ax_h[0].plot(ts, hyd['Q'][selected_pipe_idx], 'b-', label='流量 Q')
+                        ax_h[0].set_ylabel("Q (m³/s)")
+                        ax_h[0].set_title("水力模拟结果")
+                        ax_h[0].grid(True, alpha=0.3)
+                        
+                        ax2 = ax_h[0].twinx()
+                        ax2.plot(ts, hyd['v'][selected_pipe_idx], 'orange', linestyle='--', label='流速 v')
+                        ax2.set_ylabel("v (m/s)")
+                        
+                        # 水深
+                        ax_h[1].plot(ts, hyd['h'][selected_pipe_idx], 'g-', label='水深 h')
+                        ax_h[1].axhline(pipe_info['Diameter'], color='r', linestyle=':', label='管顶')
+                        ax_h[1].set_ylabel("h (m)")
+                        ax_h[1].set_xlabel("时间 (h)")
+                        ax_h[1].legend()
+                        ax_h[1].grid(True, alpha=0.3)
+                        
+                        st.pyplot(fig_h)
+                    else:
+                        st.info("暂无水力数据，请点击左侧运行模拟。")
 
-                # 3. 水质结果图表
-                if 'wq_pipe_res' in st.session_state:
-                    wq = st.session_state['wq_pipe_res'] # Shape: (Time, Pipes, 11)
-                    
-                    fig_w, ax_w = plt.subplots(figsize=(6, 3))
-                    # 绘制 DO (idx 3) 和 H2S (idx 6)
-                    ax_w.plot(ts, wq[:, selected_pipe_idx, 3], 'b-', label='DO (氧)')
-                    ax_w.plot(ts, wq[:, selected_pipe_idx, 6], 'r--', label='H2S (硫化物)')
-                    ax_w.set_title("水质模拟结果")
-                    ax_w.set_ylabel("浓度 (mg/L)")
-                    ax_w.set_xlabel("时间 (h)")
-                    ax_w.legend()
-                    ax_w.grid(True, alpha=0.3)
-                    
-                    st.pyplot(fig_w)
-                elif 'hyd_res' in st.session_state:
-                    st.info("暂无水质数据，请点击左侧运行模拟。")
+                    # 3. 水质结果图表
+                    if 'wq_pipe_res' in st.session_state:
+                        wq = st.session_state['wq_pipe_res'] # Shape: (Time, Pipes, 11)
+                        
+                        fig_w, ax_w = plt.subplots(figsize=(6, 3))
+                        # 绘制 DO (idx 3) 和 H2S (idx 6)
+                        ax_w.plot(ts, wq[:, selected_pipe_idx, 3], 'b-', label='DO (氧)')
+                        ax_w.plot(ts, wq[:, selected_pipe_idx, 6], 'r--', label='H2S (硫化物)')
+                        ax_w.set_title("水质模拟结果")
+                        ax_w.set_ylabel("浓度 (mg/L)")
+                        ax_w.set_xlabel("时间 (h)")
+                        ax_w.legend()
+                        ax_w.grid(True, alpha=0.3)
+                        
+                        st.pyplot(fig_w)
+                    elif 'hyd_res' in st.session_state:
+                        st.info("暂无水质数据，请点击左侧运行模拟。")
+                except Exception as e:
+                    st.error(f"解析选中数据时出错: {e}")
             
             else:
                 st.markdown("""
