@@ -9,7 +9,7 @@ import warnings
 import plotly.graph_objects as go 
 
 # ==========================================
-# 0. Configuration & Initialization
+# 0. 配置与初始化
 # ==========================================
 st.set_page_config(page_title="Urban Sewer Simulation (Pro)", layout="wide")
 st.markdown("""
@@ -28,7 +28,7 @@ warnings.filterwarnings('ignore')
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ==========================================
-# 1. Core Calculation Classes (Same as before)
+# 1. 核心计算类 (水力与水质)
 # ==========================================
 
 class VectorizedHydraulics:
@@ -79,12 +79,15 @@ class VectorizedHydraulics:
 class ASMKinetics(nn.Module):
     def __init__(self):
         super().__init__()
+        # 动力学参数
         self.uHO2 = 4.0; self.Ksw = 1.0; self.KO = 0.5; self.Yhw = 0.55
         self.qm = 0.5; self.XHf = 10.0; self.Kso4 = 62.85
         self.SO_sat = 8.0; self.Temp = 25.0; self.aw = 1.07
         
     def compute_rates(self, C, hydraulic_state):
-        # Indices: 0:XHw, 1:Xs1, 3:SO, 4:SF, 6:SHS, 7:SSO4, 8:CH4
+        # 状态变量索引: 
+        # 0:XHw(异养菌), 1:Xs1(慢速降解COD), 3:SO(溶解氧), 4:SF(快速降解COD)
+        # 6:SHS(硫化物/H2S), 7:SSO4(硫酸盐), 8:CH4(甲烷)
         C = torch.clamp(C, min=0.0)
         XHw = C[:, 0:1]; Xs1 = C[:, 1:2]; SO = C[:, 3:4]; SF = C[:, 4:5]
         SHS = C[:, 6:7]; SSO4 = C[:, 7:8]
@@ -94,36 +97,41 @@ class ASMKinetics(nn.Module):
         
         depth_safe = torch.clamp(depth, min=1e-3)
         vel_safe = torch.clamp(vel, min=1e-3)
+        
+        # 氧传质系数 (KLa)
         K2_day = 3.93 * (vel_safe**0.5) / (depth_safe**1.5)
         Kla = K2_day / 24.0 * (1.024 ** (self.Temp - 20))
         Kla = torch.clamp(Kla, max=100.0)
         phi = self.aw ** (self.Temp - 20)
         
+        # Monod 限制项
         M_SF = SF / (self.Ksw + SF + 1e-6)
         M_SO = SO / (self.KO + SO + 1e-6)
-        M_SO_lim = self.KO / (self.KO + SO + 1e-6)
+        M_SO_lim = self.KO / (self.KO + SO + 1e-6) # 缺氧/厌氧条件
         M_SSO4 = SSO4 / (self.Kso4 + SSO4 + 1e-6)
 
-        rho_grw = self.uHO2 * M_SF * M_SO * XHw * phi
-        rho_srb = 0.05 * M_SF * M_SSO4 * self.XHf * M_SO_lim * phi
-        rho_sox = 2.0 * M_SO * SHS * phi
-        rho_hyd = 2.0 * Xs1 * (XHw / (XHw + Xs1 + 1e-6)) * M_SO * phi
+        # 反应速率
+        rho_grw = self.uHO2 * M_SF * M_SO * XHw * phi # 好氧生长
+        rho_srb = 0.05 * M_SF * M_SSO4 * self.XHf * M_SO_lim * phi # 硫酸盐还原 (产H2S)
+        rho_sox = 2.0 * M_SO * SHS * phi # 硫化物氧化
+        rho_hyd = 2.0 * Xs1 * (XHw / (XHw + Xs1 + 1e-6)) * M_SO * phi # 水解
 
+        # 微分方程
         dXHw = rho_grw - 0.1 * XHw
         dXs1 = -rho_hyd
         dXs2 = torch.zeros_like(Xs1)
         dSO  = Kla * (self.SO_sat - SO) - ((1-self.Yhw)/self.Yhw)*rho_grw - 2.0*rho_sox
         dSF  = rho_hyd - (1/self.Yhw)*rho_grw - rho_srb
         dSac = torch.zeros_like(SF)
-        dSHS = rho_srb - rho_sox
-        dSSO4= -rho_srb + rho_sox
-        dCH4 = 0.1 * rho_srb 
+        dSHS = rho_srb - rho_sox # H2S 变化
+        dSSO4= -rho_srb + rho_sox # SO4 变化
+        dCH4 = 0.1 * rho_srb # 简化甲烷产率 (关联厌氧过程)
         dSprop = torch.zeros_like(SF); dH2 = torch.zeros_like(SF)
 
         return torch.cat([dXHw, dXs1, dXs2, dSO, dSF, dSac, dSHS, dSSO4, dCH4, dSprop, dH2], dim=1)
 
 # ==========================================
-# 2. Data Processing & Caching
+# 2. 数据处理与模拟逻辑
 # ==========================================
 
 @st.cache_data
@@ -209,7 +217,7 @@ def run_hydraulic_simulation(df_pipe, sim_hours):
     return {'Q': res_Q, 'v': res_v, 'h': res_h}
 
 @st.cache_data
-def run_wq_simulation(df_pipe, hyd_res_dict):
+def run_wq_simulation(df_pipe, hyd_res_dict, use_seawater, use_food_waste):
     Q = hyd_res_dict['Q']; v = hyd_res_dict['v']; h = hyd_res_dict['h']
     sim_steps = Q.shape[1]
     
@@ -228,7 +236,7 @@ def run_wq_simulation(df_pipe, hyd_res_dict):
     
     num_nodes = len(nodes_uniq)
     C_nodes = torch.zeros((num_nodes, 11), device=device) + 1e-6
-    C_nodes[:, 3] = 6.0 
+    C_nodes[:, 3] = 6.0 # Initial DO
     
     asm = ASMKinetics().to(device)
     history_pipes = []
@@ -237,13 +245,18 @@ def run_wq_simulation(df_pipe, hyd_res_dict):
     in_degs = [G.in_degree(n) for n in nodes_uniq]
     src_idxs = torch.tensor([i for i, d in enumerate(in_degs) if d == 0], dtype=torch.long, device=device)
     
+    # === 场景参数设置 ===
+    so4_baseline = 120.0 if use_seawater else 20.0
+    cod_multiplier = 2.0 if use_food_waste else 1.0
+    
     for t in range(sim_steps):
         if len(src_idxs) > 0:
             pattern = 1.0 + 0.5 * np.sin(2*np.pi*(t-8)/24)
-            C_nodes[src_idxs, 0] = 30.0 * pattern 
-            C_nodes[src_idxs, 1] = 150.0 * pattern 
-            C_nodes[src_idxs, 4] = 100.0 * pattern # Soluble COD
-            C_nodes[src_idxs, 7] = 40.0 
+            # 边界条件注入
+            C_nodes[src_idxs, 0] = 30.0 * pattern * cod_multiplier # Biomass
+            C_nodes[src_idxs, 1] = 150.0 * pattern * cod_multiplier # Particulate COD
+            C_nodes[src_idxs, 4] = 100.0 * pattern * cod_multiplier # Soluble COD
+            C_nodes[src_idxs, 7] = so4_baseline # SO4 (基于海水开关)
         
         curr_v = hyd_data['v'][t]; curr_L = hyd_data['L'][t]; curr_Q = hyd_data['Q'][t]
         res_time = torch.clamp((curr_L / (curr_v + 1e-4)) / 3600.0, max=1.0)
@@ -272,7 +285,7 @@ def run_wq_simulation(df_pipe, hyd_res_dict):
     return torch.stack(history_pipes, dim=0).numpy()
 
 # ==========================================
-# 3. Plotting Helper Functions
+# 3. 绘图辅助函数
 # ==========================================
 
 def create_interactive_map(df_pipe):
@@ -305,7 +318,6 @@ def create_interactive_map(df_pipe):
     ))
 
     # 3. Identify and Mark WWTP (Sinks)
-    # Logic: Nodes that appear in Downstream but NOT in Upstream
     us_nodes = set(df_pipe['UpstreamNode'])
     ds_nodes = set(df_pipe['DownstreamNode'])
     sinks = ds_nodes - us_nodes
@@ -313,8 +325,6 @@ def create_interactive_map(df_pipe):
     sink_x = []
     sink_y = []
     for sink in sinks:
-        # Find a pipe that ends at this sink to get coordinates
-        # We take the first match
         pipe_ending = df_pipe[df_pipe['DownstreamNode'] == sink].iloc[0]
         sink_x.append(pipe_ending['DS_X'])
         sink_y.append(pipe_ending['DS_Y'])
@@ -343,7 +353,7 @@ def create_interactive_map(df_pipe):
     return fig
 
 # ==========================================
-# 4. Streamlit Interface
+# 4. Streamlit 界面
 # ==========================================
 
 st.title("🏙️ Urban Drainage Network Simulation (Pro)")
@@ -353,12 +363,23 @@ with st.sidebar:
     st.header("1. Data Import")
     uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
     
-    st.header("2. Control Panel")
-    sim_hours = st.slider("Simulation Duration (h)", 12, 48, 24)
+    st.header("2. Simulation Control")
+    sim_hours = st.slider("Duration (h)", 12, 48, 24)
+    
+    st.divider()
+    st.header("3. Scenario Settings")
+    
+    # 开关 1: 海水冲厕
+    use_seawater = st.toggle("🌊 Seawater Flushing", value=False, 
+                             help="ON: Influent SO4 = 120 mgS/L\nOFF: Influent SO4 = 20 mgS/L")
+    
+    # 开关 2: 厨余垃圾
+    use_food_waste = st.toggle("🍔 Food Waste Disposer", value=False, 
+                               help="ON: Influent COD x 2")
     
     if uploaded_file:
         st.divider()
-        st.info("Calculations are cached. Re-running with same settings is instant.")
+        st.info("Calculations are cached. Changing scenarios updates results instantly.")
 
 # --- Main Logic ---
 if uploaded_file:
@@ -369,12 +390,12 @@ if uploaded_file:
         with st.spinner("Processing Hydraulics..."):
             hyd_results = run_hydraulic_simulation(df_pipe, sim_hours)
         
+        # 传入开关状态到水质模拟函数
         with st.spinner("Processing Water Quality..."):
-            wq_results = run_wq_simulation(df_pipe, hyd_results)
+            wq_results = run_wq_simulation(df_pipe, hyd_results, use_seawater, use_food_waste)
             
         st.success("Simulation Ready! Click red dots to inspect pipes.")
 
-        # --- Display Layout ---
         col_map, col_detail = st.columns([3, 2])
         
         with col_map:
@@ -422,29 +443,42 @@ if uploaded_file:
                         st.pyplot(fig_h)
 
                     with tab2:
-                        # Extracting specific pollutants
-                        # Index 1: Xs1 (Particulate), Index 4: SF (Soluble) -> Total COD
-                        cod_series = wq_results[:, idx, 1] + wq_results[:, idx, 4]
+                        # Data Extraction
+                        # 0:XHw, 1:Xs1, 3:SO, 4:SF, 6:SHS, 7:SSO4, 8:CH4
+                        cod_series = wq_results[:, idx, 1] + wq_results[:, idx, 4] # Total COD
+                        do_series = wq_results[:, idx, 3]  # Dissolved Oxygen
                         so4_series = wq_results[:, idx, 7] # Sulfate
+                        h2s_series = wq_results[:, idx, 6] # Sulfide (H2S)
                         ch4_series = wq_results[:, idx, 8] # Methane
                         
-                        fig_w, ax_w = plt.subplots(3, 1, figsize=(5, 8), sharex=True)
+                        # Create 5 subplots
+                        fig_w, ax_w = plt.subplots(5, 1, figsize=(6, 12), sharex=True)
                         
-                        # COD Plot
+                        # 1. COD
                         ax_w[0].plot(ts, cod_series, color='#8e44ad', lw=2)
-                        ax_w[0].set_title("Total COD (mg/L)", fontsize=10)
+                        ax_w[0].set_title("Total COD (mg/L)", fontsize=10, loc='left')
                         ax_w[0].grid(True, alpha=0.3)
                         
-                        # SO4 Plot
-                        ax_w[1].plot(ts, so4_series, color='#f39c12', lw=2)
-                        ax_w[1].set_title("Sulfate (SO₄²⁻) (mg/L)", fontsize=10)
+                        # 2. DO (New)
+                        ax_w[1].plot(ts, do_series, color='#3498db', lw=2)
+                        ax_w[1].set_title("Dissolved Oxygen (DO) (mg/L)", fontsize=10, loc='left')
                         ax_w[1].grid(True, alpha=0.3)
                         
-                        # CH4 Plot
-                        ax_w[2].plot(ts, ch4_series, color='#c0392b', lw=2)
-                        ax_w[2].set_title("Methane (CH₄) (mg/L)", fontsize=10)
-                        ax_w[2].set_xlabel("Time (h)")
+                        # 3. SO4
+                        ax_w[2].plot(ts, so4_series, color='#f39c12', lw=2)
+                        ax_w[2].set_title("Sulfate (SO₄²⁻) (mgS/L)", fontsize=10, loc='left')
                         ax_w[2].grid(True, alpha=0.3)
+                        
+                        # 4. H2S (New)
+                        ax_w[3].plot(ts, h2s_series, color='#e74c3c', lw=2)
+                        ax_w[3].set_title("Sulfide (H₂S) (mgS/L)", fontsize=10, loc='left')
+                        ax_w[3].grid(True, alpha=0.3)
+                        
+                        # 5. CH4
+                        ax_w[4].plot(ts, ch4_series, color='#d35400', lw=2, linestyle='--')
+                        ax_w[4].set_title("Methane (CH₄) (mg/L)", fontsize=10, loc='left')
+                        ax_w[4].set_xlabel("Time (h)")
+                        ax_w[4].grid(True, alpha=0.3)
                         
                         plt.tight_layout()
                         st.pyplot(fig_w)
