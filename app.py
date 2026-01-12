@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 # ==========================================
 # 0. 配置与初始化
 # ==========================================
-st.set_page_config(page_title="Urban Sewer Simulation (HRT Tracker)", layout="wide")
+st.set_page_config(page_title="Urban Sewer Simulation (Custom Inflow)", layout="wide")
 st.markdown("""
 <style>
 .main { background-color: #f8f9fa; }
@@ -129,25 +129,41 @@ class ASMKinetics(nn.Module):
 
 @st.cache_data
 def process_uploaded_data(df):
+    # 1. 标准化列名映射
     col_map = {
         'name': 'PipeID', 'start': 'UpstreamNode', 'end': 'DownstreamNode',
         'length': 'Length', 'diameter': 'Diameter', 'slope': 'Slope',
-        'us_x': 'US_X', 'us_y': 'US_Y', 'ds_x': 'DS_X', 'ds_y': 'DS_Y'
+        'us_x': 'US_X', 'us_y': 'US_Y', 'ds_x': 'DS_X', 'ds_y': 'DS_Y',
+        # 允许用户使用不同的变体，但统一映射到 'inflow_baseline'
+        'inflow': 'inflow_baseline', 
+        'flow': 'inflow_baseline',
+        'base_flow': 'inflow_baseline',
+        'q_base': 'inflow_baseline'
     }
     df = df.rename(columns=col_map)
-    required = ['PipeID', 'UpstreamNode', 'DownstreamNode', 'Length', 'Diameter', 'Slope']
-    if any(c not in df.columns for c in required): return None
     
+    # 2. 检查必要列
+    required = ['PipeID', 'UpstreamNode', 'DownstreamNode', 'Length', 'Diameter', 'Slope']
+    if any(c not in df.columns for c in required): 
+        return None, f"Missing required columns. Found: {list(df.columns)}"
+    
+    # 3. 检查 inflow_baseline
+    if 'inflow_baseline' not in df.columns:
+        return None, "Missing required column: 'inflow_baseline' (or 'inflow', 'flow', 'base_flow'). Unit should be m³/s."
+    
+    # 4. 数据清洗
     df['UpstreamNode'] = df['UpstreamNode'].astype(str)
     df['DownstreamNode'] = df['DownstreamNode'].astype(str)
     df['Slope'] = df['Slope'].clip(lower=0.001)
+    df['inflow_baseline'] = df['inflow_baseline'].fillna(0.0) # 缺失值补0
+    
     if 'Manning' not in df.columns: df['Manning'] = 0.013
     
     if 'US_X' in df.columns and 'DS_X' in df.columns:
         df['Mid_X'] = (df['US_X'] + df['DS_X']) / 2
         df['Mid_Y'] = (df['US_Y'] + df['DS_Y']) / 2
         
-    return df
+    return df, None
 
 @st.cache_data
 def build_graph(df_pipe):
@@ -174,10 +190,24 @@ def run_hydraulic_simulation(df_pipe, sim_hours):
     # 24小时循环模式
     hour_of_day = time_steps % 24
     
+    # === 修改点：从 DataFrame 中聚合用户提供的 inflow_baseline ===
+    # 逻辑：将 CSV 中每一行的 inflow_baseline 归属到该行的 UpstreamNode
+    # 如果有多个管道从同一个节点出发，我们假设这些 inflow 是累加的外部流入
+    node_baseline_map = df_pipe.groupby('UpstreamNode')['inflow_baseline'].sum().to_dict()
+    
     for node in all_nodes:
-        base = np.random.uniform(0.001, 0.008)
+        # 获取用户定义的基准流量，如果节点没有作为 UpstreamNode 出现（例如纯末端节点），则默认为 0
+        base = node_baseline_map.get(node, 0.0)
+        
+        # 仍然应用日变化模式 (Diurnal Pattern)
+        # 如果 base 为 0，则整个序列为 0
         pat = 0.3 + 0.6 * np.exp(-((hour_of_day - 8)**2) / 8) + 0.5 * np.exp(-((hour_of_day - 20)**2) / 8)
-        node_inflows[node] = np.maximum(base * pat, 0.0001)
+        
+        # 确保最小流量不为负，且给一个极小值防止除零（如果 base > 0）
+        if base > 0:
+            node_inflows[node] = np.maximum(base * pat, 0.0001)
+        else:
+            node_inflows[node] = np.zeros(sim_hours)
 
     solver = VectorizedHydraulics()
     num_pipes = len(df_pipe)
@@ -192,7 +222,11 @@ def run_hydraulic_simulation(df_pipe, sim_hours):
         for u in topo_nodes:
             total_in = node_acc[u]
             out_edges = list(G.out_edges(u, data=True))
+            
+            # 如果没有出边，流量流出系统（到达WWTP或Outfall）
             if not out_edges: continue
+            
+            # 简单假设：均分给下游管道
             flow_per = total_in / len(out_edges)
             for _, v_node, data in out_edges:
                 pid = data['pipe_id']
@@ -238,6 +272,9 @@ def run_wq_simulation(df_pipe, hyd_res_dict, use_seawater, use_food_waste):
     asm = ASMKinetics().to(device)
     history_pipes = []
     
+    # 识别源头节点（入度为0的节点），只有这些节点会持续补充污染物
+    # 注意：这里我们简单假设所有源头都有污染物输入
+    # 如果想更精确，可以结合 inflow_baseline > 0 的节点来判断
     G = build_graph(df_pipe)
     in_degs = [G.in_degree(n) for n in nodes_uniq]
     src_idxs = torch.tensor([i for i, d in enumerate(in_degs) if d == 0], dtype=torch.long, device=device)
@@ -286,43 +323,26 @@ def run_wq_simulation(df_pipe, hyd_res_dict, use_seawater, use_food_waste):
 # ==========================================
 
 def calculate_downstream_hrt(start_node, G, df_pipe, avg_velocities):
-    """
-    计算从 start_node 到最终出水口(out_degree=0) 的平均HRT。
-    使用模拟期间的平均流速。
-    """
-    # 找到所有可能的终点（出水口）
     sinks = [n for n in G.nodes() if G.out_degree(n) == 0]
-    
     max_hrt = 0
-    
-    # 构建 PipeID -> 平均流速 的映射
     pipe_v_map = dict(zip(df_pipe['PipeID'], avg_velocities))
     
     for sink in sinks:
         try:
-            # 找到到终点的所有简单路径
             paths = list(nx.all_simple_paths(G, source=start_node, target=sink))
-            
             for path in paths:
                 path_hrt = 0
-                # 遍历路径上的每一段边
                 for i in range(len(path) - 1):
                     u, v = path[i], path[i+1]
                     edge_data = G.get_edge_data(u, v)
                     pid = edge_data['pipe_id']
                     length = edge_data['length']
-                    
-                    # 获取该管道的平均流速，避免除以零
                     vel = max(pipe_v_map.get(pid, 0.1), 0.01) 
-                    
-                    # HRT (hours) = Length (m) / Velocity (m/s) / 3600
                     path_hrt += (length / vel) / 3600.0
-                
                 if path_hrt > max_hrt:
                     max_hrt = path_hrt
         except nx.NetworkXNoPath:
             continue
-            
     return max_hrt
 
 # ==========================================
@@ -346,14 +366,16 @@ def create_interactive_map(df_pipe):
         name='Pipes'
     ))
 
+    # 根据 inflow_baseline 大小调整节点颜色或大小（可选）
+    # 这里简单展示所有节点
     fig.add_trace(go.Scatter(
         x=df_pipe['Mid_X'], y=df_pipe['Mid_Y'],
         mode='markers',
         marker=dict(size=8, color='rgba(231, 76, 60, 0.7)', line=dict(width=1, color='white')),
         name='Select Pipe',
         text=df_pipe['PipeID'],
-        hovertemplate='<b>Pipe: %{text}</b><extra></extra>',
-        customdata=df_pipe.index 
+        hovertemplate='<b>Pipe: %{text}</b><br>Inflow Base: %{customdata[0]:.4f} m³/s<extra></extra>',
+        customdata=np.stack((df_pipe['inflow_baseline'], df_pipe.index), axis=-1)
     ))
 
     us_nodes = set(df_pipe['UpstreamNode'])
@@ -378,7 +400,7 @@ def create_interactive_map(df_pipe):
         ))
 
     fig.update_layout(
-        title="Network Map (Green = WWTP, Red = Pipes)",
+        title="Network Map",
         xaxis_title="X (m)", yaxis_title="Y (m)",
         showlegend=True,
         hovermode='closest',
@@ -394,15 +416,15 @@ def create_interactive_map(df_pipe):
 # 5. Streamlit 界面
 # ==========================================
 
-st.title("🏙️ Urban Drainage Network Simulation (HRT Tracker)")
+st.title("🏙️ Urban Drainage Network (Custom Inflow & HRT)")
 
 with st.sidebar:
     st.header("1. Data Import")
-    uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
+    uploaded_file = st.file_uploader("Upload CSV File", type=["csv"], 
+                                     help="Must contain columns: PipeID, UpstreamNode, DownstreamNode, Length, Diameter, Slope, inflow_baseline (m³/s)")
     
     st.header("2. Simulation Control")
-    sim_hours = st.slider("Duration (Hours)", min_value=24, max_value=168, value=48, step=12, 
-                          help="Max 7 days (168 hours). Diurnal pattern loops every 24h.")
+    sim_hours = st.slider("Duration (Hours)", min_value=24, max_value=168, value=48, step=12)
     
     st.divider()
     st.header("3. Scenario Settings")
@@ -411,24 +433,24 @@ with st.sidebar:
     
     if uploaded_file:
         st.divider()
-        st.info("Calculations are cached.")
+        st.info("Using user-provided 'inflow_baseline' for simulation.")
 
 if uploaded_file:
     df_raw = pd.read_csv(uploaded_file)
-    df_pipe = process_uploaded_data(df_raw)
+    df_pipe, error_msg = process_uploaded_data(df_raw)
     
-    if df_pipe is not None:
+    if error_msg:
+        st.error(error_msg)
+    elif df_pipe is not None:
         with st.spinner("Processing Hydraulics..."):
             hyd_results = run_hydraulic_simulation(df_pipe, sim_hours)
         
         with st.spinner("Processing Water Quality..."):
             wq_results = run_wq_simulation(df_pipe, hyd_results, use_seawater, use_food_waste)
             
-        st.success(f"Simulation Complete ({sim_hours} hours)! Click red dots to inspect pipes.")
+        st.success(f"Simulation Complete! Used inflow data from CSV.")
 
         col_map, col_detail = st.columns([3, 2])
-        
-        # 构建图结构用于 HRT 计算
         G_network = build_graph(df_pipe)
         
         with col_map:
@@ -440,8 +462,9 @@ if uploaded_file:
                 selected_pipe_idx = None
                 if selection and selection['selection']['points']:
                     for point in selection['selection']['points']:
+                        # customdata is now [inflow, index]
                         if 'customdata' in point:
-                            selected_pipe_idx = point['customdata']
+                            selected_pipe_idx = point['customdata'][1] 
                             break
             else:
                 st.warning("No coordinate data found in CSV.")
@@ -454,28 +477,20 @@ if uploaded_file:
                     idx = int(selected_pipe_idx)
                     pipe_info = df_pipe.iloc[idx]
                     
-                    # --- HRT Calculation Logic ---
-                    # 1. 获取所有管道的平均流速 (沿时间轴平均)
+                    # HRT Calculation
                     avg_velocities = np.mean(hyd_results['v'], axis=1)
-                    
-                    # 2. 计算从当前管道的下游节点出发，到全网终点的HRT
                     start_node = str(pipe_info['DownstreamNode'])
-                    
-                    # 3. 加上当前管道本身的HRT (Length / Avg Velocity)
                     current_pipe_vel = max(avg_velocities[idx], 0.01)
                     current_pipe_hrt = (pipe_info['Length'] / current_pipe_vel) / 3600.0
-                    
                     downstream_hrt = calculate_downstream_hrt(start_node, G_network, df_pipe, avg_velocities)
                     total_hrt = current_pipe_hrt + downstream_hrt
                     
-                    # --- Display Header Info ---
                     st.markdown(f"### Pipe: `{pipe_info['PipeID']}`")
                     
-                    # Metrics Row
-                    m1, m2 = st.columns(2)
+                    m1, m2, m3 = st.columns(3)
                     m1.metric("Length", f"{pipe_info['Length']:.1f} m")
-                    m2.metric("⏱️ HRT to WWTP", f"{total_hrt:.2f} h", 
-                              help="Estimated travel time from this pipe to the network outlet based on average velocities.")
+                    m2.metric("Inflow Base", f"{pipe_info['inflow_baseline']:.4f}", "m³/s")
+                    m3.metric("⏱️ HRT to WWTP", f"{total_hrt:.2f} h")
                     
                     st.divider()
 
@@ -506,7 +521,6 @@ if uploaded_file:
                         ch4_series = wq_results[:, idx, 8] 
                         
                         fig_w, ax_w = plt.subplots(5, 1, figsize=(6, 12), sharex=True)
-                        
                         ax_w[0].plot(ts, cod_series, color='#8e44ad', lw=2)
                         ax_w[0].set_title("Total COD (mg/L)", fontsize=10, loc='left')
                         ax_w[0].grid(True, alpha=0.3)
@@ -527,7 +541,6 @@ if uploaded_file:
                         ax_w[4].set_title("Methane (CH₄) (mg/L)", fontsize=10, loc='left')
                         ax_w[4].set_xlabel("Time (h)")
                         ax_w[4].grid(True, alpha=0.3)
-                        
                         plt.tight_layout()
                         st.pyplot(fig_w)
                         
@@ -537,4 +550,4 @@ if uploaded_file:
                 st.info("Select a red node on the map to view HRT and time-series data.")
 
 else:
-    st.info("👈 Upload your network CSV to begin.")
+    st.info("👈 Upload your network CSV to begin. Ensure it has an 'inflow_baseline' column.")
