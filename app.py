@@ -6,16 +6,17 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import warnings
-import io
+import plotly.graph_objects as go # 新增 Plotly
 
 # ==========================================
 # 0. 配置与初始化
 # ==========================================
-st.set_page_config(page_title="城市管网模拟 (Custom Data)", layout="wide")
+st.set_page_config(page_title="城市管网模拟 (交互版)", layout="wide")
 st.markdown("""
 <style>
 .main { background-color: #f8f9fa; }
 h1 { color: #2c3e50; }
+.stPlotlyChart { border: 1px solid #e0e0e0; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -27,12 +28,11 @@ warnings.filterwarnings('ignore')
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ==========================================
-# 1. 核心计算类 (保持不变)
+# 1. 核心计算类
 # ==========================================
 
 class VectorizedHydraulics:
     def solve_normal_depth(self, Q_target, D, S, n):
-        # 强制 S > 0 防止除零
         S = np.where(S <= 1e-6, 1e-6, S)
         sqrt_S = np.sqrt(S)
         Q_full_capacity = (1/n) * (np.pi*(D/2)**2) * ((D/4)**(2/3)) * sqrt_S
@@ -123,50 +123,29 @@ class ASMKinetics(nn.Module):
         return torch.cat([dXHw, dXs1, dXs2, dSO, dSF, dSac, dSHS, dSSO4, dCH4, dSprop, dH2], dim=1)
 
 # ==========================================
-# 2. 数据处理函数 (针对你的CSV格式)
+# 2. 数据处理函数
 # ==========================================
 
 def process_uploaded_data(df):
-    """
-    处理用户上传的特定格式 CSV
-    列映射: name->PipeID, start->UpstreamNode, end->DownstreamNode, etc.
-    """
-    # 1. 列名映射字典
     col_map = {
-        'name': 'PipeID',
-        'start': 'UpstreamNode',
-        'end': 'DownstreamNode',
-        'length': 'Length',
-        'diameter': 'Diameter',
-        'slope': 'Slope',
-        'us_x': 'US_X', 'us_y': 'US_Y',
-        'ds_x': 'DS_X', 'ds_y': 'DS_Y'
+        'name': 'PipeID', 'start': 'UpstreamNode', 'end': 'DownstreamNode',
+        'length': 'Length', 'diameter': 'Diameter', 'slope': 'Slope',
+        'us_x': 'US_X', 'us_y': 'US_Y', 'ds_x': 'DS_X', 'ds_y': 'DS_Y'
     }
-    
-    # 2. 重命名
     df = df.rename(columns=col_map)
+    required = ['PipeID', 'UpstreamNode', 'DownstreamNode', 'Length', 'Diameter', 'Slope']
+    if any(c not in df.columns for c in required): return None
     
-    # 3. 检查必要列
-    required_cols = ['PipeID', 'UpstreamNode', 'DownstreamNode', 'Length', 'Diameter', 'Slope']
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        st.error(f"数据缺少必要列 (映射后): {missing}")
-        return None
-
-    # 4. 数据清洗
-    # 强制节点ID为字符串
     df['UpstreamNode'] = df['UpstreamNode'].astype(str)
     df['DownstreamNode'] = df['DownstreamNode'].astype(str)
-    
-    # 修正 Slope = 0 的情况 (防止曼宁公式报错)
-    zero_slope_count = (df['Slope'] <= 0).sum()
-    if zero_slope_count > 0:
-        st.warning(f"检测到 {zero_slope_count} 条管段坡度为 0，已自动修正为 0.001 以进行计算。")
+    if (df['Slope'] <= 0).any():
         df['Slope'] = df['Slope'].clip(lower=0.001)
-        
-    # 默认曼宁系数
-    if 'Manning' not in df.columns:
-        df['Manning'] = 0.013
+    if 'Manning' not in df.columns: df['Manning'] = 0.013
+    
+    # 计算管段中心点，用于交互点击
+    if 'US_X' in df.columns and 'DS_X' in df.columns:
+        df['Mid_X'] = (df['US_X'] + df['DS_X']) / 2
+        df['Mid_Y'] = (df['US_Y'] + df['DS_Y']) / 2
         
     return df
 
@@ -185,38 +164,88 @@ def generate_heterogeneous_inflows(nodes, hours=24):
     return node_inflows
 
 # ==========================================
-# 3. Streamlit 界面
+# 3. 绘图辅助函数
 # ==========================================
 
-st.title("🏙️ 城市排水管网模拟系统")
-st.markdown("支持自定义 CSV 格式 (包含坐标数据)")
+def create_interactive_map(df_pipe):
+    fig = go.Figure()
+
+    # 1. 绘制管线 (背景层，不可点击或点击无反馈)
+    # 为了性能，使用 None 断开的方式绘制单条 Trace
+    x_lines = []
+    y_lines = []
+    for _, row in df_pipe.iterrows():
+        x_lines.extend([row['US_X'], row['DS_X'], None])
+        y_lines.extend([row['US_Y'], row['DS_Y'], None])
+    
+    fig.add_trace(go.Scatter(
+        x=x_lines, y=y_lines,
+        mode='lines',
+        line=dict(color='gray', width=2),
+        hoverinfo='skip', # 禁用悬停
+        name='Pipes'
+    ))
+
+    # 2. 绘制节点 (简单的装饰)
+    fig.add_trace(go.Scatter(
+        x=df_pipe['US_X'], y=df_pipe['US_Y'],
+        mode='markers',
+        marker=dict(size=6, color='blue'),
+        name='Nodes',
+        hoverinfo='skip'
+    ))
+
+    # 3. 绘制管段中心交互点 (关键层)
+    # 这是用户真正点击的对象
+    fig.add_trace(go.Scatter(
+        x=df_pipe['Mid_X'], y=df_pipe['Mid_Y'],
+        mode='markers',
+        marker=dict(size=10, color='rgba(255, 0, 0, 0.5)', line=dict(width=1, color='red')),
+        name='Pipe Select',
+        text=df_pipe['PipeID'], # 悬停显示 PipeID
+        hovertemplate='<b>Pipe: %{text}</b><extra></extra>',
+        customdata=df_pipe.index # 存储索引以便回调获取
+    ))
+
+    fig.update_layout(
+        title="管网交互地图 (点击红色锚点查看详情)",
+        xaxis_title="X Coordinate",
+        yaxis_title="Y Coordinate",
+        showlegend=False,
+        hovermode='closest',
+        margin=dict(l=0, r=0, t=40, b=0),
+        height=500
+    )
+    return fig
+
+# ==========================================
+# 4. Streamlit 界面
+# ==========================================
+
+st.title("🏙️ 城市排水管网模拟系统 (交互版)")
 
 # --- 侧边栏 ---
 with st.sidebar:
     st.header("1. 数据导入")
     uploaded_file = st.file_uploader("上传 CSV 文件", type=["csv"])
     
-    # 提供示例数据格式说明
-    with st.expander("查看支持的数据格式"):
+    with st.expander("查看数据格式示例"):
         st.markdown("""
-        您的 CSV 应包含以下列 (大小写不敏感):
-        - `name`: 管段ID
-        - `start`: 上游节点ID
-        - `end`: 下游节点ID
-        - `length`: 长度 (m)
-        - `diameter`: 管径 (m)
-        - `slope`: 坡度
-        - `us_x`, `us_y`: 上游坐标 (可选，用于绘图)
-        - `ds_x`, `ds_y`: 下游坐标 (可选，用于绘图)
+        CSV 必须包含: `name`, `start`, `end`, `length`, `diameter`, `slope`, `us_x`, `us_y`, `ds_x`, `ds_y`
         """)
 
-    st.header("2. 模拟参数")
+    st.header("2. 控制面板")
     sim_hours = st.slider("模拟时长 (h)", 12, 48, 24)
-    st.info(f"计算设备: {device}")
+    
+    # 模拟触发按钮区
+    if uploaded_file:
+        st.divider()
+        st.subheader("模拟执行")
+        btn_hyd = st.button("▶️ 1. 运行水力模拟", type="primary", use_container_width=True)
+        btn_wq = st.button("▶️ 2. 运行水质模拟", use_container_width=True, disabled=('hyd_res' not in st.session_state))
 
 # --- 主逻辑 ---
 if uploaded_file:
-    # 读取并处理数据
     df_raw = pd.read_csv(uploaded_file)
     df_pipe = process_uploaded_data(df_raw)
     
@@ -224,240 +253,210 @@ if uploaded_file:
         # 构建图
         G = nx.DiGraph()
         for _, row in df_pipe.iterrows():
-            # 添加边属性，包括坐标以便绘图
-            edge_attrs = {'pipe_id': row['PipeID']}
-            if 'US_X' in row and 'DS_X' in row:
-                edge_attrs['pos_src'] = (row['US_X'], row['US_Y'])
-                edge_attrs['pos_dst'] = (row['DS_X'], row['DS_Y'])
-            G.add_edge(row['UpstreamNode'], row['DownstreamNode'], **edge_attrs)
+            G.add_edge(row['UpstreamNode'], row['DownstreamNode'], pipe_id=row['PipeID'])
         
-        # 环路处理
-        if not nx.is_directed_acyclic_graph(G):
-            st.warning("检测到环路，正在自动断开以支持水力计算...")
-            while not nx.is_directed_acyclic_graph(G):
-                try:
-                    cycle = nx.find_cycle(G)
-                    G.remove_edge(*cycle[0])
-                except: break
-        
+        # 破环处理
+        while not nx.is_directed_acyclic_graph(G):
+            try:
+                cycle = nx.find_cycle(G)
+                G.remove_edge(*cycle[0])
+            except: break
         topo_nodes = list(nx.topological_sort(G))
+
+        # === 逻辑处理：水力模拟 ===
+        if btn_hyd:
+            with st.spinner("正在进行水力计算..."):
+                all_nodes = list(G.nodes())
+                node_inflows = generate_heterogeneous_inflows(all_nodes, hours=sim_hours)
+                solver = VectorizedHydraulics()
+                
+                num_pipes = len(df_pipe)
+                res_Q = np.zeros((num_pipes, sim_hours))
+                res_v = np.zeros((num_pipes, sim_hours))
+                res_h = np.zeros((num_pipes, sim_hours))
+                
+                for t in range(sim_hours):
+                    node_acc = {n: node_inflows[n][t] for n in all_nodes}
+                    pipe_flow_snap = {}
+                    for u in topo_nodes:
+                        total_in = node_acc[u]
+                        out_edges = list(G.out_edges(u, data=True))
+                        if not out_edges: continue
+                        flow_per = total_in / len(out_edges)
+                        for _, v_node, data in out_edges:
+                            pid = data['pipe_id']
+                            pipe_flow_snap[pid] = flow_per
+                            if v_node in node_acc: node_acc[v_node] += flow_per
+                    
+                    curr_Q = np.array([pipe_flow_snap.get(pid, 0.0) for pid in df_pipe['PipeID']])
+                    h, v, A, P = solver.solve_normal_depth(
+                        curr_Q, df_pipe['Diameter'].values, df_pipe['Slope'].values, df_pipe['Manning'].values
+                    )
+                    res_Q[:, t] = curr_Q; res_v[:, t] = v; res_h[:, t] = h
+                
+                st.session_state['hyd_res'] = {'Q': res_Q, 'v': res_v, 'h': res_h, 'df': df_pipe}
+                st.success("水力模拟完成！")
+                st.rerun()
+
+        # === 逻辑处理：水质模拟 ===
+        if btn_wq and 'hyd_res' in st.session_state:
+            with st.spinner("正在进行水质计算..."):
+                hyd_res = st.session_state['hyd_res']
+                df_p = hyd_res['df']
+                sim_steps = hyd_res['Q'].shape[1]
+                
+                nodes_uniq = sorted(list(set(df_p['UpstreamNode']).union(set(df_p['DownstreamNode']))))
+                n_map = {n: i for i, n in enumerate(nodes_uniq)}
+                edge_src = [n_map[u] for u in df_p['UpstreamNode']]
+                edge_dst = [n_map[v] for v in df_p['DownstreamNode']]
+                edge_idx = torch.tensor([edge_src, edge_dst], dtype=torch.long, device=device)
+                
+                hyd_data = {
+                    'Q': torch.tensor(hyd_res['Q'].T, dtype=torch.float32, device=device),
+                    'v': torch.tensor(hyd_res['v'].T, dtype=torch.float32, device=device),
+                    'h': torch.tensor(hyd_res['h'].T, dtype=torch.float32, device=device),
+                    'L': torch.tensor(df_p['Length'].values, dtype=torch.float32, device=device).unsqueeze(0).expand(sim_steps, -1)
+                }
+                
+                num_nodes = len(nodes_uniq)
+                C_nodes = torch.zeros((num_nodes, 11), device=device) + 1e-6
+                C_nodes[:, 3] = 6.0 
+                asm = ASMKinetics().to(device)
+                
+                # 存储管段结果 (Time, Pipe, Params)
+                history_pipes = [] 
+                
+                in_degs = [G.in_degree(n) for n in nodes_uniq]
+                src_idxs = torch.tensor([i for i, d in enumerate(in_degs) if d == 0], dtype=torch.long, device=device)
+                
+                for t in range(sim_steps):
+                    if len(src_idxs) > 0:
+                        pattern = 1.0 + 0.5 * np.sin(2*np.pi*(t-8)/24)
+                        C_nodes[src_idxs, 0] = 30.0 * pattern 
+                        C_nodes[src_idxs, 1] = 150.0 * pattern 
+                        C_nodes[src_idxs, 7] = 40.0 
+                    
+                    curr_v = hyd_data['v'][t]; curr_L = hyd_data['L'][t]; curr_Q = hyd_data['Q'][t]
+                    res_time = torch.clamp((curr_L / (curr_v + 1e-4)) / 3600.0, max=1.0)
+                    
+                    C_in = C_nodes[edge_idx[0]]
+                    hyd_state_t = {k: v[t].unsqueeze(1) for k, v in hyd_data.items() if k in ['v','h']}
+                    
+                    rates = asm.compute_rates(C_in, hyd_state_t)
+                    C_out = C_in + rates * res_time.unsqueeze(1)
+                    C_out = torch.clamp(C_out, min=1e-6)
+                    
+                    # 保存管段当前时刻的输出浓度
+                    history_pipes.append(C_out.clone().cpu())
+                    
+                    mass = C_out * curr_Q.unsqueeze(1)
+                    tot_m = torch.zeros((num_nodes, 11), device=device)
+                    tot_q = torch.zeros((num_nodes, 1), device=device)
+                    tot_m.index_add_(0, edge_idx[1], mass)
+                    tot_q.index_add_(0, edge_idx[1], curr_Q.unsqueeze(1))
+                    
+                    mask = (tot_q > 1e-6).squeeze()
+                    valid_dst = torch.unique(edge_idx[1])
+                    valid_dst = valid_dst[mask[valid_dst]]
+                    if len(valid_dst) > 0:
+                        C_nodes[valid_dst] = tot_m[valid_dst] / tot_q[valid_dst]
+                
+                st.session_state['wq_pipe_res'] = torch.stack(history_pipes, dim=0).numpy()
+                st.success("水质模拟完成！")
+                st.rerun()
+
+        # === 界面展示 ===
+        col_map, col_detail = st.columns([3, 2])
         
-        # 界面标签页
-        tab_map, tab_hyd, tab_asm, tab_data = st.tabs(["🗺️ 管网地图", "🌊 水力模拟", "🧪 水质模拟", "📄 数据概览"])
-
-        # === Tab 1: 管网地图 ===
-        with tab_map:
-            st.subheader("管网平面分布图")
+        with col_map:
+            st.subheader("🗺️ 管网地图")
             if 'US_X' in df_pipe.columns:
-                fig_map, ax_map = plt.subplots(figsize=(10, 8))
+                fig = create_interactive_map(df_pipe)
+                # 关键：捕获选择事件
+                selection = st.plotly_chart(fig, on_select="rerun", selection_mode="points", use_container_width=True)
                 
-                # 绘制管段
-                for _, row in df_pipe.iterrows():
-                    ax_map.plot([row['US_X'], row['DS_X']], [row['US_Y'], row['DS_Y']], 
-                                color='gray', alpha=0.5, linewidth=1)
-                
-                # 绘制节点 (简单的散点)
-                ax_map.scatter(df_pipe['US_X'], df_pipe['US_Y'], s=10, c='blue', alpha=0.6, label='Nodes')
-                
-                ax_map.set_title(f"管网拓扑结构 (共 {len(df_pipe)} 条管段)")
-                ax_map.set_xlabel("X Coordinate")
-                ax_map.set_ylabel("Y Coordinate")
-                ax_map.axis('equal')
-                st.pyplot(fig_map)
+                # 解析选择
+                selected_pipe_idx = None
+                if selection and selection['selection']['points']:
+                    # 获取被点击点的索引 (对应 df_pipe 的行号)
+                    point_info = selection['selection']['points'][0]
+                    # 只有点击了 curveNumber=2 (即 Pipe Select 层) 才有效
+                    if point_info['curveNumber'] == 2:
+                        selected_pipe_idx = point_info['pointIndex']
             else:
-                st.warning("数据中未检测到 us_x, us_y 等坐标列，无法绘制地图。")
+                st.warning("缺少坐标数据，无法绘图")
 
-        # === Tab 2: 水力模拟 ===
-        with tab_hyd:
-            col1, col2 = st.columns([1, 4])
-            if col1.button("▶️ 开始水力计算", type="primary"):
-                with st.spinner("正在求解曼宁方程..."):
-                    all_nodes = list(G.nodes())
-                    node_inflows = generate_heterogeneous_inflows(all_nodes, hours=sim_hours)
-                    solver = VectorizedHydraulics()
-                    
-                    num_pipes = len(df_pipe)
-                    res_Q = np.zeros((num_pipes, sim_hours))
-                    res_v = np.zeros((num_pipes, sim_hours))
-                    res_h = np.zeros((num_pipes, sim_hours))
-                    
-                    prog_bar = st.progress(0)
-                    
-                    for t in range(sim_hours):
-                        node_acc = {n: node_inflows[n][t] for n in all_nodes}
-                        pipe_flow_snap = {}
-                        
-                        for u in topo_nodes:
-                            total_in = node_acc[u]
-                            out_edges = list(G.out_edges(u, data=True))
-                            if not out_edges: continue
-                            flow_per = total_in / len(out_edges)
-                            for _, v_node, data in out_edges:
-                                pid = data['pipe_id']
-                                pipe_flow_snap[pid] = flow_per
-                                if v_node in node_acc:
-                                    node_acc[v_node] += flow_per
-                        
-                        curr_Q = np.array([pipe_flow_snap.get(pid, 0.0) for pid in df_pipe['PipeID']])
-                        h, v, A, P = solver.solve_normal_depth(
-                            curr_Q, df_pipe['Diameter'].values, df_pipe['Slope'].values, df_pipe['Manning'].values
-                        )
-                        
-                        res_Q[:, t] = curr_Q
-                        res_v[:, t] = v
-                        res_h[:, t] = h
-                        prog_bar.progress((t+1)/sim_hours)
-                    
-                    st.session_state['hyd_res'] = {'Q': res_Q, 'v': res_v, 'h': res_h, 'df': df_pipe}
-                    st.success("计算完成！")
+        with col_detail:
+            st.subheader("📊 详细数据面板")
             
-            if 'hyd_res' in st.session_state:
-                res = st.session_state['hyd_res']
-                st.markdown("#### 结果分析")
+            if selected_pipe_idx is not None:
+                pipe_info = df_pipe.iloc[selected_pipe_idx]
+                pipe_id = pipe_info['PipeID']
+                st.info(f"当前选中管段: **{pipe_id}**")
                 
-                # 选择管段
-                sel_pipe = st.selectbox("选择管段查看详情", df_pipe['PipeID'].values)
-                idx = df_pipe[df_pipe['PipeID'] == sel_pipe].index[0]
-                
-                fig_h, ax_h = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
-                ts = range(sim_hours)
-                
-                ax_h[0].plot(ts, res['Q'][idx], color='#1f77b4', marker='.')
-                ax_h[0].set_ylabel("流量 Q (m3/s)")
-                ax_h[0].set_title(f"管段 {sel_pipe} 水力过程线")
-                
-                ax_h[1].plot(ts, res['v'][idx], color='#ff7f0e', marker='.')
-                ax_h[1].set_ylabel("流速 v (m/s)")
-                
-                ax_h[2].plot(ts, res['h'][idx], color='#2ca02c', marker='.')
-                ax_h[2].axhline(df_pipe.iloc[idx]['Diameter'], ls='--', c='r', alpha=0.5, label='管顶')
-                ax_h[2].set_ylabel("水深 h (m)")
-                ax_h[2].legend()
-                
-                st.pyplot(fig_h)
+                # 1. 基础属性
+                with st.expander("管段属性", expanded=False):
+                    st.json({
+                        "Length": f"{pipe_info['Length']} m",
+                        "Diameter": f"{pipe_info['Diameter']} m",
+                        "Slope": pipe_info['Slope'],
+                        "Upstream": pipe_info['UpstreamNode'],
+                        "Downstream": pipe_info['DownstreamNode']
+                    })
 
-        # === Tab 3: 水质模拟 ===
-        with tab_asm:
-            if 'hyd_res' not in st.session_state:
-                st.warning("请先完成水力模拟。")
-            else:
-                if st.button("▶️ 开始 ASM 水质模拟", type="primary"):
-                    hyd_res = st.session_state['hyd_res']
-                    df_p = hyd_res['df']
+                # 2. 水力结果图表
+                if 'hyd_res' in st.session_state:
+                    hyd = st.session_state['hyd_res']
+                    ts = range(hyd['Q'].shape[1])
                     
-                    # 准备拓扑
-                    nodes_uniq = sorted(list(set(df_p['UpstreamNode']).union(set(df_p['DownstreamNode']))))
-                    n_map = {n: i for i, n in enumerate(nodes_uniq)}
+                    fig_h, ax_h = plt.subplots(2, 1, figsize=(6, 5), sharex=True)
                     
-                    edge_src = [n_map[u] for u in df_p['UpstreamNode']]
-                    edge_dst = [n_map[v] for v in df_p['DownstreamNode']]
-                    edge_idx = torch.tensor([edge_src, edge_dst], dtype=torch.long, device=device)
+                    # 流量与流速
+                    ax_h[0].plot(ts, hyd['Q'][selected_pipe_idx], 'b-', label='流量 Q')
+                    ax_h[0].set_ylabel("Q (m³/s)")
+                    ax_h[0].set_title("水力模拟结果")
+                    ax_h[0].grid(True, alpha=0.3)
                     
-                    # ==========================================
-                    # 修复点：数据形状对齐
-                    # 目标形状均为: (sim_hours, num_pipes)
-                    # ==========================================
-                    sim_steps = hyd_res['Q'].shape[1] # 获取实际模拟时长列数
-                    num_pipes = len(df_p)
+                    ax2 = ax_h[0].twinx()
+                    ax2.plot(ts, hyd['v'][selected_pipe_idx], 'orange', linestyle='--', label='流速 v')
+                    ax2.set_ylabel("v (m/s)")
+                    
+                    # 水深
+                    ax_h[1].plot(ts, hyd['h'][selected_pipe_idx], 'g-', label='水深 h')
+                    ax_h[1].axhline(pipe_info['Diameter'], color='r', linestyle=':', label='管顶')
+                    ax_h[1].set_ylabel("h (m)")
+                    ax_h[1].set_xlabel("时间 (h)")
+                    ax_h[1].legend()
+                    ax_h[1].grid(True, alpha=0.3)
+                    
+                    st.pyplot(fig_h)
+                else:
+                    st.info("暂无水力数据，请点击左侧运行模拟。")
 
-                    hyd_data = {
-                        # 注意这里添加了 .T 进行转置，将 (Pipe, Time) 变为 (Time, Pipe)
-                        'Q': torch.tensor(hyd_res['Q'].T, dtype=torch.float32, device=device),
-                        'v': torch.tensor(hyd_res['v'].T, dtype=torch.float32, device=device),
-                        'h': torch.tensor(hyd_res['h'].T, dtype=torch.float32, device=device),
-                        
-                        # 静态属性扩展为 (Time, Pipe)
-                        'D': torch.tensor(df_p['Diameter'].values, dtype=torch.float32, device=device).unsqueeze(0).expand(sim_steps, -1),
-                        'S': torch.tensor(df_p['Slope'].values, dtype=torch.float32, device=device).unsqueeze(0).expand(sim_steps, -1),
-                        'L': torch.tensor(df_p['Length'].values, dtype=torch.float32, device=device).unsqueeze(0).expand(sim_steps, -1)
-                    }
+                # 3. 水质结果图表
+                if 'wq_pipe_res' in st.session_state:
+                    wq = st.session_state['wq_pipe_res'] # Shape: (Time, Pipes, 11)
                     
-                    # 模拟循环
-                    num_nodes = len(nodes_uniq)
-                    C_nodes = torch.zeros((num_nodes, 11), device=device) + 1e-6
-                    C_nodes[:, 3] = 6.0 # 初始 DO
-                    
-                    asm = ASMKinetics().to(device)
-                    history = []
-                    prog_asm = st.progress(0)
-                    
-                    # 简单的源头入流
-                    in_degs = [G.in_degree(n) for n in nodes_uniq]
-                    src_idxs = torch.tensor([i for i, d in enumerate(in_degs) if d == 0], dtype=torch.long, device=device)
-                    
-                    for t in range(sim_steps):
-                        # 边界条件
-                        if len(src_idxs) > 0:
-                            pattern = 1.0 + 0.5 * np.sin(2*np.pi*(t-8)/24)
-                            C_nodes[src_idxs, 0] = 30.0 * pattern # XHw
-                            C_nodes[src_idxs, 1] = 150.0 * pattern # COD
-                            C_nodes[src_idxs, 7] = 40.0 # Sulfate
-                        
-                        # 反应
-                        # 现在 hyd_data['v'][t] 取出的是 (num_pipes,) 形状的向量，与 L 形状一致
-                        curr_v = hyd_data['v'][t]
-                        curr_L = hyd_data['L'][t]
-                        curr_Q = hyd_data['Q'][t]
-                        
-                        # 这里的除法现在是安全的：(num_pipes,) / (num_pipes,)
-                        res_time = torch.clamp((curr_L / (curr_v + 1e-4)) / 3600.0, max=1.0)
-                        
-                        C_in = C_nodes[edge_idx[0]] # (num_pipes, 11)
-                        
-                        # 准备水力状态供 kinetics 使用，需要 unsqueeze 变成 (num_pipes, 1)
-                        hyd_state_t = {k: v[t].unsqueeze(1) for k, v in hyd_data.items() if k in ['v','h','D','S']}
-                        
-                        rates = asm.compute_rates(C_in, hyd_state_t)
-                        C_out = C_in + rates * res_time.unsqueeze(1)
-                        C_out = torch.clamp(C_out, min=1e-6)
-                        
-                        # 混合
-                        mass = C_out * curr_Q.unsqueeze(1)
-                        tot_m = torch.zeros((num_nodes, 11), device=device)
-                        tot_q = torch.zeros((num_nodes, 1), device=device)
-                        tot_m.index_add_(0, edge_idx[1], mass)
-                        tot_q.index_add_(0, edge_idx[1], curr_Q.unsqueeze(1))
-                        
-                        mask = (tot_q > 1e-6).squeeze()
-                        valid_dst = torch.unique(edge_idx[1])
-                        # 过滤掉无效节点
-                        valid_dst = valid_dst[mask[valid_dst]]
-                        
-                        if len(valid_dst) > 0:
-                            C_nodes[valid_dst] = tot_m[valid_dst] / tot_q[valid_dst]
-                        
-                        history.append(C_nodes.clone().cpu())
-                        prog_asm.progress((t+1)/sim_steps)
-                        
-                    st.session_state['wq_res'] = torch.stack(history, dim=0).numpy()
-                    st.session_state['nodes_list'] = nodes_uniq
-                    st.success("水质模拟完成")
-
-                if 'wq_res' in st.session_state:
-                    wq = st.session_state['wq_res']
-                    nodes = st.session_state['nodes_list']
-                    
-                    # 找出 Outfall (出度为0)
-                    outfalls = [n for n in nodes if G.out_degree(n) == 0]
-                    # 如果没有明确的出水口，显示所有节点
-                    display_nodes = outfalls if outfalls else nodes
-                    
-                    sel_node = st.selectbox("选择观测节点", display_nodes)
-                    n_idx = nodes.index(sel_node)
-                    
-                    fig_w, ax_w = plt.subplots(figsize=(10, 5))
-                    ax_w.plot(wq[:, n_idx, 6], 'r-', label='H2S (Sulfide)')
-                    ax_w.plot(wq[:, n_idx, 3], 'b--', label='DO (Oxygen)')
+                    fig_w, ax_w = plt.subplots(figsize=(6, 3))
+                    # 绘制 DO (idx 3) 和 H2S (idx 6)
+                    ax_w.plot(ts, wq[:, selected_pipe_idx, 3], 'b-', label='DO (氧)')
+                    ax_w.plot(ts, wq[:, selected_pipe_idx, 6], 'r--', label='H2S (硫化物)')
+                    ax_w.set_title("水质模拟结果")
                     ax_w.set_ylabel("浓度 (mg/L)")
                     ax_w.set_xlabel("时间 (h)")
-                    ax_w.set_title(f"节点 {sel_node} 水质")
                     ax_w.legend()
+                    ax_w.grid(True, alpha=0.3)
+                    
                     st.pyplot(fig_w)
-
-        # === Tab 4: 数据概览 ===
-        with tab_data:
-            st.dataframe(df_pipe)
+                elif 'hyd_res' in st.session_state:
+                    st.info("暂无水质数据，请点击左侧运行模拟。")
+            
+            else:
+                st.markdown("""
+                <div style="text-align: center; padding: 50px; color: #666;">
+                    👈 请点击地图上的<span style="color: red;">红色锚点</span><br>查看该管段的模拟结果
+                </div>
+                """, unsafe_allow_html=True)
 
 else:
     st.info("👈 请在左侧上传 CSV 文件以开始。")
-
