@@ -353,14 +353,23 @@ if uploaded_file:
                     edge_dst = [n_map[v] for v in df_p['DownstreamNode']]
                     edge_idx = torch.tensor([edge_src, edge_dst], dtype=torch.long, device=device)
                     
-                    # 准备数据
+                    # ==========================================
+                    # 修复点：数据形状对齐
+                    # 目标形状均为: (sim_hours, num_pipes)
+                    # ==========================================
+                    sim_steps = hyd_res['Q'].shape[1] # 获取实际模拟时长列数
+                    num_pipes = len(df_p)
+
                     hyd_data = {
-                        'Q': torch.tensor(hyd_res['Q'], dtype=torch.float32, device=device),
-                        'v': torch.tensor(hyd_res['v'], dtype=torch.float32, device=device),
-                        'h': torch.tensor(hyd_res['h'], dtype=torch.float32, device=device),
-                        'D': torch.tensor(df_p['Diameter'].values, dtype=torch.float32, device=device).unsqueeze(0).repeat(sim_hours, 1),
-                        'S': torch.tensor(df_p['Slope'].values, dtype=torch.float32, device=device).unsqueeze(0).repeat(sim_hours, 1),
-                        'L': torch.tensor(df_p['Length'].values, dtype=torch.float32, device=device).unsqueeze(0).repeat(sim_hours, 1)
+                        # 注意这里添加了 .T 进行转置，将 (Pipe, Time) 变为 (Time, Pipe)
+                        'Q': torch.tensor(hyd_res['Q'].T, dtype=torch.float32, device=device),
+                        'v': torch.tensor(hyd_res['v'].T, dtype=torch.float32, device=device),
+                        'h': torch.tensor(hyd_res['h'].T, dtype=torch.float32, device=device),
+                        
+                        # 静态属性扩展为 (Time, Pipe)
+                        'D': torch.tensor(df_p['Diameter'].values, dtype=torch.float32, device=device).unsqueeze(0).expand(sim_steps, -1),
+                        'S': torch.tensor(df_p['Slope'].values, dtype=torch.float32, device=device).unsqueeze(0).expand(sim_steps, -1),
+                        'L': torch.tensor(df_p['Length'].values, dtype=torch.float32, device=device).unsqueeze(0).expand(sim_steps, -1)
                     }
                     
                     # 模拟循环
@@ -376,7 +385,7 @@ if uploaded_file:
                     in_degs = [G.in_degree(n) for n in nodes_uniq]
                     src_idxs = torch.tensor([i for i, d in enumerate(in_degs) if d == 0], dtype=torch.long, device=device)
                     
-                    for t in range(sim_hours):
+                    for t in range(sim_steps):
                         # 边界条件
                         if len(src_idxs) > 0:
                             pattern = 1.0 + 0.5 * np.sin(2*np.pi*(t-8)/24)
@@ -385,11 +394,19 @@ if uploaded_file:
                             C_nodes[src_idxs, 7] = 40.0 # Sulfate
                         
                         # 反应
-                        curr_v = hyd_data['v'][t]; curr_L = hyd_data['L'][t]; curr_Q = hyd_data['Q'][t]
+                        # 现在 hyd_data['v'][t] 取出的是 (num_pipes,) 形状的向量，与 L 形状一致
+                        curr_v = hyd_data['v'][t]
+                        curr_L = hyd_data['L'][t]
+                        curr_Q = hyd_data['Q'][t]
+                        
+                        # 这里的除法现在是安全的：(num_pipes,) / (num_pipes,)
                         res_time = torch.clamp((curr_L / (curr_v + 1e-4)) / 3600.0, max=1.0)
                         
-                        C_in = C_nodes[edge_idx[0]]
+                        C_in = C_nodes[edge_idx[0]] # (num_pipes, 11)
+                        
+                        # 准备水力状态供 kinetics 使用，需要 unsqueeze 变成 (num_pipes, 1)
                         hyd_state_t = {k: v[t].unsqueeze(1) for k, v in hyd_data.items() if k in ['v','h','D','S']}
+                        
                         rates = asm.compute_rates(C_in, hyd_state_t)
                         C_out = C_in + rates * res_time.unsqueeze(1)
                         C_out = torch.clamp(C_out, min=1e-6)
@@ -403,11 +420,14 @@ if uploaded_file:
                         
                         mask = (tot_q > 1e-6).squeeze()
                         valid_dst = torch.unique(edge_idx[1])
+                        # 过滤掉无效节点
                         valid_dst = valid_dst[mask[valid_dst]]
-                        C_nodes[valid_dst] = tot_m[valid_dst] / tot_q[valid_dst]
+                        
+                        if len(valid_dst) > 0:
+                            C_nodes[valid_dst] = tot_m[valid_dst] / tot_q[valid_dst]
                         
                         history.append(C_nodes.clone().cpu())
-                        prog_asm.progress((t+1)/sim_hours)
+                        prog_asm.progress((t+1)/sim_steps)
                         
                     st.session_state['wq_res'] = torch.stack(history, dim=0).numpy()
                     st.session_state['nodes_list'] = nodes_uniq
@@ -419,7 +439,10 @@ if uploaded_file:
                     
                     # 找出 Outfall (出度为0)
                     outfalls = [n for n in nodes if G.out_degree(n) == 0]
-                    sel_node = st.selectbox("选择观测节点", outfalls + nodes)
+                    # 如果没有明确的出水口，显示所有节点
+                    display_nodes = outfalls if outfalls else nodes
+                    
+                    sel_node = st.selectbox("选择观测节点", display_nodes)
                     n_idx = nodes.index(sel_node)
                     
                     fig_w, ax_w = plt.subplots(figsize=(10, 5))
@@ -437,3 +460,4 @@ if uploaded_file:
 
 else:
     st.info("👈 请在左侧上传 CSV 文件以开始。")
+
