@@ -6,5 +6,6 @@ matplotlib
 pydeck
 pyproj
 plotly
-
+torch
 openpyxl
+
