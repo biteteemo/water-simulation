@@ -11,12 +11,13 @@ import plotly.graph_objects as go
 # ==========================================
 # 0. 配置与初始化
 # ==========================================
-st.set_page_config(page_title="Urban Sewer Simulation (7-Day)", layout="wide")
+st.set_page_config(page_title="Urban Sewer Simulation (HRT Tracker)", layout="wide")
 st.markdown("""
 <style>
 .main { background-color: #f8f9fa; }
 h1 { color: #2c3e50; }
 .stPlotlyChart { border: 1px solid #e0e0e0; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+div[data-testid="stMetricValue"] { font-size: 1.2rem; color: #2980b9; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -79,15 +80,11 @@ class VectorizedHydraulics:
 class ASMKinetics(nn.Module):
     def __init__(self):
         super().__init__()
-        # 动力学参数
         self.uHO2 = 4.0; self.Ksw = 1.0; self.KO = 0.5; self.Yhw = 0.55
         self.qm = 0.5; self.XHf = 10.0; self.Kso4 = 62.85
         self.SO_sat = 8.0; self.Temp = 25.0; self.aw = 1.07
         
     def compute_rates(self, C, hydraulic_state):
-        # 状态变量索引: 
-        # 0:XHw(异养菌), 1:Xs1(慢速降解COD), 3:SO(溶解氧), 4:SF(快速降解COD)
-        # 6:SHS(硫化物/H2S), 7:SSO4(硫酸盐), 8:CH4(甲烷)
         C = torch.clamp(C, min=0.0)
         XHw = C[:, 0:1]; Xs1 = C[:, 1:2]; SO = C[:, 3:4]; SF = C[:, 4:5]
         SHS = C[:, 6:7]; SSO4 = C[:, 7:8]
@@ -98,34 +95,30 @@ class ASMKinetics(nn.Module):
         depth_safe = torch.clamp(depth, min=1e-3)
         vel_safe = torch.clamp(vel, min=1e-3)
         
-        # 氧传质系数 (KLa)
         K2_day = 3.93 * (vel_safe**0.5) / (depth_safe**1.5)
         Kla = K2_day / 24.0 * (1.024 ** (self.Temp - 20))
         Kla = torch.clamp(Kla, max=100.0)
         phi = self.aw ** (self.Temp - 20)
         
-        # Monod 限制项
         M_SF = SF / (self.Ksw + SF + 1e-6)
         M_SO = SO / (self.KO + SO + 1e-6)
-        M_SO_lim = self.KO / (self.KO + SO + 1e-6) # 缺氧/厌氧条件
+        M_SO_lim = self.KO / (self.KO + SO + 1e-6)
         M_SSO4 = SSO4 / (self.Kso4 + SSO4 + 1e-6)
 
-        # 反应速率
-        rho_grw = self.uHO2 * M_SF * M_SO * XHw * phi # 好氧生长
-        rho_srb = 0.05 * M_SF * M_SSO4 * self.XHf * M_SO_lim * phi # 硫酸盐还原 (产H2S)
-        rho_sox = 2.0 * M_SO * SHS * phi # 硫化物氧化
-        rho_hyd = 2.0 * Xs1 * (XHw / (XHw + Xs1 + 1e-6)) * M_SO * phi # 水解
+        rho_grw = self.uHO2 * M_SF * M_SO * XHw * phi
+        rho_srb = 0.05 * M_SF * M_SSO4 * self.XHf * M_SO_lim * phi
+        rho_sox = 2.0 * M_SO * SHS * phi
+        rho_hyd = 2.0 * Xs1 * (XHw / (XHw + Xs1 + 1e-6)) * M_SO * phi
 
-        # 微分方程
         dXHw = rho_grw - 0.1 * XHw
         dXs1 = -rho_hyd
         dXs2 = torch.zeros_like(Xs1)
         dSO  = Kla * (self.SO_sat - SO) - ((1-self.Yhw)/self.Yhw)*rho_grw - 2.0*rho_sox
         dSF  = rho_hyd - (1/self.Yhw)*rho_grw - rho_srb
         dSac = torch.zeros_like(SF)
-        dSHS = rho_srb - rho_sox # H2S 变化
-        dSSO4= -rho_srb + rho_sox # SO4 变化
-        dCH4 = 0.1 * rho_srb # 简化甲烷产率 (关联厌氧过程)
+        dSHS = rho_srb - rho_sox
+        dSSO4= -rho_srb + rho_sox
+        dCH4 = 0.1 * rho_srb
         dSprop = torch.zeros_like(SF); dH2 = torch.zeros_like(SF)
 
         return torch.cat([dXHw, dXs1, dXs2, dSO, dSF, dSac, dSHS, dSSO4, dCH4, dSprop, dH2], dim=1)
@@ -160,7 +153,7 @@ def process_uploaded_data(df):
 def build_graph(df_pipe):
     G = nx.DiGraph()
     for _, row in df_pipe.iterrows():
-        G.add_edge(row['UpstreamNode'], row['DownstreamNode'], pipe_id=row['PipeID'])
+        G.add_edge(row['UpstreamNode'], row['DownstreamNode'], pipe_id=row['PipeID'], length=row['Length'])
     while not nx.is_directed_acyclic_graph(G):
         try:
             cycle = nx.find_cycle(G)
@@ -178,12 +171,11 @@ def run_hydraulic_simulation(df_pipe, sim_hours):
     node_inflows = {}
     time_steps = np.arange(sim_hours)
     
-    # === 关键修改：使用模运算 (%) 强制24小时循环 ===
+    # 24小时循环模式
     hour_of_day = time_steps % 24
     
     for node in all_nodes:
         base = np.random.uniform(0.001, 0.008)
-        # 双峰模式：早高峰(8点) + 晚高峰(20点)
         pat = 0.3 + 0.6 * np.exp(-((hour_of_day - 8)**2) / 8) + 0.5 * np.exp(-((hour_of_day - 20)**2) / 8)
         node_inflows[node] = np.maximum(base * pat, 0.0001)
 
@@ -241,7 +233,7 @@ def run_wq_simulation(df_pipe, hyd_res_dict, use_seawater, use_food_waste):
     
     num_nodes = len(nodes_uniq)
     C_nodes = torch.zeros((num_nodes, 11), device=device) + 1e-6
-    C_nodes[:, 3] = 6.0 # Initial DO
+    C_nodes[:, 3] = 6.0 
     
     asm = ASMKinetics().to(device)
     history_pipes = []
@@ -250,21 +242,18 @@ def run_wq_simulation(df_pipe, hyd_res_dict, use_seawater, use_food_waste):
     in_degs = [G.in_degree(n) for n in nodes_uniq]
     src_idxs = torch.tensor([i for i, d in enumerate(in_degs) if d == 0], dtype=torch.long, device=device)
     
-    # === 场景参数设置 ===
     so4_baseline = 120.0 if use_seawater else 20.0
     cod_multiplier = 2.0 if use_food_waste else 1.0
     
     for t in range(sim_steps):
         if len(src_idxs) > 0:
-            # === 关键修改：使用模运算 (%) 强制24小时循环 ===
             hour_of_day = t % 24
             pattern = 1.0 + 0.5 * np.sin(2*np.pi*(hour_of_day-8)/24)
             
-            # 边界条件注入
-            C_nodes[src_idxs, 0] = 30.0 * pattern * cod_multiplier # Biomass
-            C_nodes[src_idxs, 1] = 150.0 * pattern * cod_multiplier # Particulate COD
-            C_nodes[src_idxs, 4] = 100.0 * pattern * cod_multiplier # Soluble COD
-            C_nodes[src_idxs, 7] = so4_baseline # SO4 (基于海水开关)
+            C_nodes[src_idxs, 0] = 30.0 * pattern * cod_multiplier 
+            C_nodes[src_idxs, 1] = 150.0 * pattern * cod_multiplier 
+            C_nodes[src_idxs, 4] = 100.0 * pattern * cod_multiplier 
+            C_nodes[src_idxs, 7] = so4_baseline 
         
         curr_v = hyd_data['v'][t]; curr_L = hyd_data['L'][t]; curr_Q = hyd_data['Q'][t]
         res_time = torch.clamp((curr_L / (curr_v + 1e-4)) / 3600.0, max=1.0)
@@ -293,13 +282,56 @@ def run_wq_simulation(df_pipe, hyd_res_dict, use_seawater, use_food_waste):
     return torch.stack(history_pipes, dim=0).numpy()
 
 # ==========================================
-# 3. 绘图辅助函数
+# 3. HRT 计算功能
+# ==========================================
+
+def calculate_downstream_hrt(start_node, G, df_pipe, avg_velocities):
+    """
+    计算从 start_node 到最终出水口(out_degree=0) 的平均HRT。
+    使用模拟期间的平均流速。
+    """
+    # 找到所有可能的终点（出水口）
+    sinks = [n for n in G.nodes() if G.out_degree(n) == 0]
+    
+    max_hrt = 0
+    
+    # 构建 PipeID -> 平均流速 的映射
+    pipe_v_map = dict(zip(df_pipe['PipeID'], avg_velocities))
+    
+    for sink in sinks:
+        try:
+            # 找到到终点的所有简单路径
+            paths = list(nx.all_simple_paths(G, source=start_node, target=sink))
+            
+            for path in paths:
+                path_hrt = 0
+                # 遍历路径上的每一段边
+                for i in range(len(path) - 1):
+                    u, v = path[i], path[i+1]
+                    edge_data = G.get_edge_data(u, v)
+                    pid = edge_data['pipe_id']
+                    length = edge_data['length']
+                    
+                    # 获取该管道的平均流速，避免除以零
+                    vel = max(pipe_v_map.get(pid, 0.1), 0.01) 
+                    
+                    # HRT (hours) = Length (m) / Velocity (m/s) / 3600
+                    path_hrt += (length / vel) / 3600.0
+                
+                if path_hrt > max_hrt:
+                    max_hrt = path_hrt
+        except nx.NetworkXNoPath:
+            continue
+            
+    return max_hrt
+
+# ==========================================
+# 4. 绘图辅助函数
 # ==========================================
 
 def create_interactive_map(df_pipe):
     fig = go.Figure()
 
-    # 1. Pipes
     x_lines = []
     y_lines = []
     for _, row in df_pipe.iterrows():
@@ -314,7 +346,6 @@ def create_interactive_map(df_pipe):
         name='Pipes'
     ))
 
-    # 2. Interactive Pipe Centers
     fig.add_trace(go.Scatter(
         x=df_pipe['Mid_X'], y=df_pipe['Mid_Y'],
         mode='markers',
@@ -325,7 +356,6 @@ def create_interactive_map(df_pipe):
         customdata=df_pipe.index 
     ))
 
-    # 3. Identify and Mark WWTP (Sinks)
     us_nodes = set(df_pipe['UpstreamNode'])
     ds_nodes = set(df_pipe['DownstreamNode'])
     sinks = ds_nodes - us_nodes
@@ -361,37 +391,28 @@ def create_interactive_map(df_pipe):
     return fig
 
 # ==========================================
-# 4. Streamlit 界面
+# 5. Streamlit 界面
 # ==========================================
 
-st.title("🏙️ Urban Drainage Network Simulation (7-Day)")
+st.title("🏙️ Urban Drainage Network Simulation (HRT Tracker)")
 
-# --- Sidebar ---
 with st.sidebar:
     st.header("1. Data Import")
     uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
     
     st.header("2. Simulation Control")
-    # 延长到7天 (168小时)
     sim_hours = st.slider("Duration (Hours)", min_value=24, max_value=168, value=48, step=12, 
                           help="Max 7 days (168 hours). Diurnal pattern loops every 24h.")
     
     st.divider()
     st.header("3. Scenario Settings")
-    
-    # 开关 1: 海水冲厕
-    use_seawater = st.toggle("🌊 Seawater Flushing", value=False, 
-                             help="ON: Influent SO4 = 120 mgS/L\nOFF: Influent SO4 = 20 mgS/L")
-    
-    # 开关 2: 厨余垃圾
-    use_food_waste = st.toggle("🍔 Food Waste Disposer", value=False, 
-                               help="ON: Influent COD x 2")
+    use_seawater = st.toggle("🌊 Seawater Flushing", value=False)
+    use_food_waste = st.toggle("🍔 Food Waste Disposer", value=False)
     
     if uploaded_file:
         st.divider()
-        st.info("Calculations are cached. Changing scenarios updates results instantly.")
+        st.info("Calculations are cached.")
 
-# --- Main Logic ---
 if uploaded_file:
     df_raw = pd.read_csv(uploaded_file)
     df_pipe = process_uploaded_data(df_raw)
@@ -400,13 +421,15 @@ if uploaded_file:
         with st.spinner("Processing Hydraulics..."):
             hyd_results = run_hydraulic_simulation(df_pipe, sim_hours)
         
-        # 传入开关状态到水质模拟函数
         with st.spinner("Processing Water Quality..."):
             wq_results = run_wq_simulation(df_pipe, hyd_results, use_seawater, use_food_waste)
             
         st.success(f"Simulation Complete ({sim_hours} hours)! Click red dots to inspect pipes.")
 
         col_map, col_detail = st.columns([3, 2])
+        
+        # 构建图结构用于 HRT 计算
+        G_network = build_graph(df_pipe)
         
         with col_map:
             st.subheader("🗺️ Network Map")
@@ -431,8 +454,31 @@ if uploaded_file:
                     idx = int(selected_pipe_idx)
                     pipe_info = df_pipe.iloc[idx]
                     
+                    # --- HRT Calculation Logic ---
+                    # 1. 获取所有管道的平均流速 (沿时间轴平均)
+                    avg_velocities = np.mean(hyd_results['v'], axis=1)
+                    
+                    # 2. 计算从当前管道的下游节点出发，到全网终点的HRT
+                    start_node = str(pipe_info['DownstreamNode'])
+                    
+                    # 3. 加上当前管道本身的HRT (Length / Avg Velocity)
+                    current_pipe_vel = max(avg_velocities[idx], 0.01)
+                    current_pipe_hrt = (pipe_info['Length'] / current_pipe_vel) / 3600.0
+                    
+                    downstream_hrt = calculate_downstream_hrt(start_node, G_network, df_pipe, avg_velocities)
+                    total_hrt = current_pipe_hrt + downstream_hrt
+                    
+                    # --- Display Header Info ---
                     st.markdown(f"### Pipe: `{pipe_info['PipeID']}`")
                     
+                    # Metrics Row
+                    m1, m2 = st.columns(2)
+                    m1.metric("Length", f"{pipe_info['Length']:.1f} m")
+                    m2.metric("⏱️ HRT to WWTP", f"{total_hrt:.2f} h", 
+                              help="Estimated travel time from this pipe to the network outlet based on average velocities.")
+                    
+                    st.divider()
+
                     tab1, tab2 = st.tabs(["💧 Hydraulics", "🧪 Water Quality"])
                     ts = range(sim_hours)
                     
@@ -453,38 +499,30 @@ if uploaded_file:
                         st.pyplot(fig_h)
 
                     with tab2:
-                        # Data Extraction
-                        # 0:XHw, 1:Xs1, 3:SO, 4:SF, 6:SHS, 7:SSO4, 8:CH4
-                        cod_series = wq_results[:, idx, 1] + wq_results[:, idx, 4] # Total COD
-                        do_series = wq_results[:, idx, 3]  # Dissolved Oxygen
-                        so4_series = wq_results[:, idx, 7] # Sulfate
-                        h2s_series = wq_results[:, idx, 6] # Sulfide (H2S)
-                        ch4_series = wq_results[:, idx, 8] # Methane
+                        cod_series = wq_results[:, idx, 1] + wq_results[:, idx, 4] 
+                        do_series = wq_results[:, idx, 3]  
+                        so4_series = wq_results[:, idx, 7] 
+                        h2s_series = wq_results[:, idx, 6] 
+                        ch4_series = wq_results[:, idx, 8] 
                         
-                        # Create 5 subplots
                         fig_w, ax_w = plt.subplots(5, 1, figsize=(6, 12), sharex=True)
                         
-                        # 1. COD
                         ax_w[0].plot(ts, cod_series, color='#8e44ad', lw=2)
                         ax_w[0].set_title("Total COD (mg/L)", fontsize=10, loc='left')
                         ax_w[0].grid(True, alpha=0.3)
                         
-                        # 2. DO (New)
                         ax_w[1].plot(ts, do_series, color='#3498db', lw=2)
                         ax_w[1].set_title("Dissolved Oxygen (DO) (mg/L)", fontsize=10, loc='left')
                         ax_w[1].grid(True, alpha=0.3)
                         
-                        # 3. SO4
                         ax_w[2].plot(ts, so4_series, color='#f39c12', lw=2)
                         ax_w[2].set_title("Sulfate (SO₄²⁻) (mgS/L)", fontsize=10, loc='left')
                         ax_w[2].grid(True, alpha=0.3)
                         
-                        # 4. H2S (New)
                         ax_w[3].plot(ts, h2s_series, color='#e74c3c', lw=2)
                         ax_w[3].set_title("Sulfide (H₂S) (mgS/L)", fontsize=10, loc='left')
                         ax_w[3].grid(True, alpha=0.3)
                         
-                        # 5. CH4
                         ax_w[4].plot(ts, ch4_series, color='#d35400', lw=2, linestyle='--')
                         ax_w[4].set_title("Methane (CH₄) (mg/L)", fontsize=10, loc='left')
                         ax_w[4].set_xlabel("Time (h)")
@@ -496,7 +534,7 @@ if uploaded_file:
                 except Exception as e:
                     st.error(f"Error displaying data: {e}")
             else:
-                st.info("Select a red node on the map to view time-series data.")
+                st.info("Select a red node on the map to view HRT and time-series data.")
 
 else:
     st.info("👈 Upload your network CSV to begin.")
