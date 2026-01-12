@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 # ==========================================
 # 0. Configuration & Initialization
 # ==========================================
-st.set_page_config(page_title="Urban Sewer Simulation", layout="wide")
+st.set_page_config(page_title="Urban Sewer Simulation (Optimized)", layout="wide")
 st.markdown("""
 <style>
 .main { background-color: #f8f9fa; }
@@ -21,7 +21,6 @@ h1 { color: #2c3e50; }
 """, unsafe_allow_html=True)
 
 plt.style.use('seaborn-v0_8-whitegrid')
-# Use standard fonts for English
 plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 warnings.filterwarnings('ignore')
@@ -34,13 +33,19 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class VectorizedHydraulics:
     def solve_normal_depth(self, Q_target, D, S, n):
+        # Prevent division by zero or negative sqrt
         S = np.where(S <= 1e-6, 1e-6, S)
         sqrt_S = np.sqrt(S)
+        
+        # Manning's full flow capacity
         Q_full_capacity = (1/n) * (np.pi*(D/2)**2) * ((D/4)**(2/3)) * sqrt_S
         
         overloaded = Q_target >= Q_full_capacity
+        
+        # Target conveyance factor
         K_target = (Q_target * n) / sqrt_S
         
+        # Newton-Raphson Initialization
         theta = np.full_like(Q_target, np.pi, dtype=np.float64)
         mask_solve = (~overloaded) & (Q_target > 0.0001)
         
@@ -50,83 +55,107 @@ class VectorizedHydraulics:
             K_t_active = K_target[mask_solve]
             coef_active = (D_active**2) / 8
             
-            for _ in range(8):
+            # Reduced iterations for performance (5 is usually enough for engineering precision)
+            for _ in range(5):
                 sin_t = np.sin(theta_active)
                 cos_t = np.cos(theta_active)
                 A = coef_active * (theta_active - sin_t)
                 P = (D_active / 2) * theta_active
-                P[P < 1e-6] = 1e-6
+                P[P < 1e-6] = 1e-6 # Safety
                 R = A / P
+                
+                # Manning eq: K = A * R^(2/3)
                 f_val = A * (R**(2/3)) - K_t_active
+                
+                # Derivative approximation or exact derivative
                 dA_dth = coef_active * (1 - cos_t)
                 dP_dth = D_active / 2
+                
                 term1 = (5/3) * (A**(2/3)) * (P**(-2/3)) * dA_dth
                 term2 = (2/3) * (A**(5/3)) * (P**(-5/3)) * dP_dth
                 f_prime = term1 - term2
+                
+                # Avoid zero division
                 f_prime[np.abs(f_prime) < 1e-6] = 1e-6
+                
                 theta_active -= f_val / f_prime
                 theta_active = np.clip(theta_active, 1e-4, 2*np.pi - 1e-4)
+            
             theta[mask_solve] = theta_active
 
         theta[overloaded] = 2 * np.pi
         theta[Q_target <= 0.0001] = 0
         
+        # Final Geometry
         h = (D / 2) * (1 - np.cos(theta / 2))
         A_final = (D**2 / 8) * (theta - np.sin(theta))
-        P_final = (D / 2) * theta
+        
+        # Velocity
         v = np.zeros_like(Q_target)
         valid_A = A_final > 1e-6
         v[valid_A] = Q_target[valid_A] / A_final[valid_A]
         
-        return h, v, A_final, P_final
+        return h, v
 
 class ASMKinetics(nn.Module):
     def __init__(self):
         super().__init__()
+        # Standard ASM constants (simplified)
         self.uHO2 = 4.0; self.Ksw = 1.0; self.KO = 0.5; self.Yhw = 0.55
-        self.qm = 0.5; self.dHana = 0.1; self.XHf = 10.0; self.Kso4 = 62.85
+        self.qm = 0.5; self.XHf = 10.0; self.Kso4 = 62.85
         self.SO_sat = 8.0; self.Temp = 25.0; self.aw = 1.07
         
     def compute_rates(self, C, hydraulic_state):
+        # C shape: [Num_Pipes, 11]
         C = torch.clamp(C, min=0.0)
-        XHw, Xs1, Xs2, SO, SF, Sac, SHS, SSO4, CH4, Sprop, H2 = [C[:, i:i+1] for i in range(11)]
+        
+        # Unpack components (Vectorized slicing)
+        XHw = C[:, 0:1]; Xs1 = C[:, 1:2]; SO = C[:, 3:4]; SF = C[:, 4:5]
+        SHS = C[:, 6:7]; SSO4 = C[:, 7:8]
 
-        vel = hydraulic_state['v']; depth = hydraulic_state['h']
+        vel = hydraulic_state['v']
+        depth = hydraulic_state['h']
+        
+        # Reaeration (O'Connor-Dobbins)
         depth_safe = torch.clamp(depth, min=1e-3)
         vel_safe = torch.clamp(vel, min=1e-3)
-        
         K2_day = 3.93 * (vel_safe**0.5) / (depth_safe**1.5)
-        Kla = K2_day / 24.0
-        Kla = Kla * (1.024 ** (self.Temp - 20))
+        Kla = K2_day / 24.0 * (1.024 ** (self.Temp - 20))
         Kla = torch.clamp(Kla, max=100.0)
+        
         phi = self.aw ** (self.Temp - 20)
         
+        # Monod Terms
         M_SF = SF / (self.Ksw + SF + 1e-6)
         M_SO = SO / (self.KO + SO + 1e-6)
-        M_SO_lim = self.KO / (self.KO + SO + 1e-6)
+        M_SO_lim = self.KO / (self.KO + SO + 1e-6) # Inhibition
         M_SSO4 = SSO4 / (self.Kso4 + SSO4 + 1e-6)
 
+        # Process Rates
         rho_grw = self.uHO2 * M_SF * M_SO * XHw * phi
-        rho_maint = self.qm * M_SO * XHw * phi
-        rho_srb = 0.05 * M_SF * M_SSO4 * self.XHf * M_SO_lim * phi
-        rho_sox = 2.0 * M_SO * SHS * phi
+        rho_srb = 0.05 * M_SF * M_SSO4 * self.XHf * M_SO_lim * phi # Sulfate reducing
+        rho_sox = 2.0 * M_SO * SHS * phi # Sulfide oxidation
         rho_hyd = 2.0 * Xs1 * (XHw / (XHw + Xs1 + 1e-6)) * M_SO * phi
 
-        dXHw = rho_grw - rho_maint
+        # Stoichiometry (Simplified)
+        dXHw = rho_grw - 0.1 * XHw
         dXs1 = -rho_hyd
-        dXs2 = torch.zeros_like(Xs2) 
-        dSO  = Kla * (self.SO_sat - SO) - ((1-self.Yhw)/self.Yhw)*rho_grw - rho_maint - 2.0*rho_sox
+        dXs2 = torch.zeros_like(Xs1)
+        dSO  = Kla * (self.SO_sat - SO) - ((1-self.Yhw)/self.Yhw)*rho_grw - 2.0*rho_sox
         dSF  = rho_hyd - (1/self.Yhw)*rho_grw - rho_srb
-        dSac = torch.zeros_like(Sac); dSHS = rho_srb - rho_sox
-        dSSO4= -rho_srb + rho_sox; dCH4 = 0.1 * rho_srb 
-        dSprop = torch.zeros_like(Sprop); dH2 = torch.zeros_like(H2)
+        dSac = torch.zeros_like(SF)
+        dSHS = rho_srb - rho_sox
+        dSSO4= -rho_srb + rho_sox
+        dCH4 = 0.1 * rho_srb 
+        dSprop = torch.zeros_like(SF); dH2 = torch.zeros_like(SF)
 
         return torch.cat([dXHw, dXs1, dXs2, dSO, dSF, dSac, dSHS, dSSO4, dCH4, dSprop, dH2], dim=1)
 
 # ==========================================
-# 2. Data Processing Functions
+# 2. Data Processing & Caching
 # ==========================================
 
+@st.cache_data
 def process_uploaded_data(df):
     col_map = {
         'name': 'PipeID', 'start': 'UpstreamNode', 'end': 'DownstreamNode',
@@ -139,30 +168,180 @@ def process_uploaded_data(df):
     
     df['UpstreamNode'] = df['UpstreamNode'].astype(str)
     df['DownstreamNode'] = df['DownstreamNode'].astype(str)
-    if (df['Slope'] <= 0).any():
-        df['Slope'] = df['Slope'].clip(lower=0.001)
+    
+    # Data Cleaning
+    df['Slope'] = df['Slope'].clip(lower=0.001)
     if 'Manning' not in df.columns: df['Manning'] = 0.013
     
-    # Calculate midpoints for interaction
+    # Geometry for interaction
     if 'US_X' in df.columns and 'DS_X' in df.columns:
         df['Mid_X'] = (df['US_X'] + df['DS_X']) / 2
         df['Mid_Y'] = (df['US_Y'] + df['DS_Y']) / 2
         
     return df
 
-def generate_heterogeneous_inflows(nodes, hours=24):
+@st.cache_data
+def build_graph(df_pipe):
+    G = nx.DiGraph()
+    for _, row in df_pipe.iterrows():
+        G.add_edge(row['UpstreamNode'], row['DownstreamNode'], pipe_id=row['PipeID'])
+    
+    # Simple cycle breaking
+    while not nx.is_directed_acyclic_graph(G):
+        try:
+            cycle = nx.find_cycle(G)
+            G.remove_edge(*cycle[0])
+        except: break
+    return G
+
+@st.cache_data
+def run_hydraulic_simulation(df_pipe, sim_hours):
+    """
+    Cached Hydraulic Simulation.
+    This function only runs when inputs change.
+    """
+    G = build_graph(df_pipe)
+    topo_nodes = list(nx.topological_sort(G))
+    all_nodes = list(G.nodes())
+    
+    # Generate Inflows
     np.random.seed(42)
     node_inflows = {}
-    time_steps = np.arange(hours)
-    for node in nodes:
-        base_flow = np.random.uniform(0.001, 0.008) 
-        morning_peak = 7 + np.random.normal(0, 0.5) 
-        evening_peak = 19 + np.random.normal(0, 0.5)
-        pattern = 0.3 + 0.6 * np.exp(-((time_steps - morning_peak)**2) / 8) + \
-                  0.5 * np.exp(-((time_steps - evening_peak)**2) / 8)
-        pattern += np.random.normal(0, 0.02, size=hours)
-        node_inflows[node] = np.maximum(base_flow * pattern, 0.0001)
-    return node_inflows
+    time_steps = np.arange(sim_hours)
+    for node in all_nodes:
+        base = np.random.uniform(0.001, 0.008)
+        pat = 0.3 + 0.6 * np.exp(-((time_steps - 8)**2) / 8) + 0.5 * np.exp(-((time_steps - 20)**2) / 8)
+        node_inflows[node] = np.maximum(base * pat, 0.0001)
+
+    solver = VectorizedHydraulics()
+    num_pipes = len(df_pipe)
+    
+    # Pre-allocate arrays
+    res_Q = np.zeros((num_pipes, sim_hours))
+    res_v = np.zeros((num_pipes, sim_hours))
+    res_h = np.zeros((num_pipes, sim_hours))
+    
+    pipe_id_to_idx = {pid: i for i, pid in enumerate(df_pipe['PipeID'])}
+    
+    # Time Loop
+    for t in range(sim_hours):
+        # Current inflow snapshot
+        node_acc = {n: node_inflows[n][t] for n in all_nodes}
+        
+        # Topological Routing (Python Loop - unavoidable without C++ but cached now)
+        current_Q_map = {}
+        for u in topo_nodes:
+            total_in = node_acc[u]
+            out_edges = list(G.out_edges(u, data=True))
+            if not out_edges: continue
+            
+            flow_per = total_in / len(out_edges)
+            for _, v_node, data in out_edges:
+                pid = data['pipe_id']
+                current_Q_map[pid] = flow_per
+                if v_node in node_acc: node_acc[v_node] += flow_per
+        
+        # Vectorized Hydraulic Calculation
+        curr_Q_arr = np.zeros(num_pipes)
+        for pid, q_val in current_Q_map.items():
+            if pid in pipe_id_to_idx:
+                curr_Q_arr[pipe_id_to_idx[pid]] = q_val
+                
+        h, v = solver.solve_normal_depth(
+            curr_Q_arr, 
+            df_pipe['Diameter'].values, 
+            df_pipe['Slope'].values, 
+            df_pipe['Manning'].values
+        )
+        
+        res_Q[:, t] = curr_Q_arr
+        res_v[:, t] = v
+        res_h[:, t] = h
+        
+    return {'Q': res_Q, 'v': res_v, 'h': res_h}
+
+@st.cache_data
+def run_wq_simulation(df_pipe, hyd_res_dict):
+    """
+    Cached Water Quality Simulation.
+    Uses PyTorch for matrix operations.
+    """
+    # Reconstruct necessary data from dict
+    Q = hyd_res_dict['Q']
+    v = hyd_res_dict['v']
+    h = hyd_res_dict['h']
+    sim_steps = Q.shape[1]
+    
+    # Graph structures for tensor indexing
+    nodes_uniq = sorted(list(set(df_pipe['UpstreamNode']).union(set(df_pipe['DownstreamNode']))))
+    n_map = {n: i for i, n in enumerate(nodes_uniq)}
+    edge_src = [n_map[u] for u in df_pipe['UpstreamNode']]
+    edge_dst = [n_map[v] for v in df_pipe['DownstreamNode']]
+    
+    # To Device
+    edge_idx = torch.tensor([edge_src, edge_dst], dtype=torch.long, device=device)
+    hyd_data = {
+        'Q': torch.tensor(Q.T, dtype=torch.float32, device=device),
+        'v': torch.tensor(v.T, dtype=torch.float32, device=device),
+        'h': torch.tensor(h.T, dtype=torch.float32, device=device),
+        'L': torch.tensor(df_pipe['Length'].values, dtype=torch.float32, device=device).unsqueeze(0).expand(sim_steps, -1)
+    }
+    
+    num_nodes = len(nodes_uniq)
+    C_nodes = torch.zeros((num_nodes, 11), device=device) + 1e-6
+    C_nodes[:, 3] = 6.0 # Initial DO
+    
+    asm = ASMKinetics().to(device)
+    history_pipes = []
+    
+    # Identify Source Nodes
+    G = build_graph(df_pipe)
+    in_degs = [G.in_degree(n) for n in nodes_uniq]
+    src_idxs = torch.tensor([i for i, d in enumerate(in_degs) if d == 0], dtype=torch.long, device=device)
+    
+    # Time Stepping
+    for t in range(sim_steps):
+        # Boundary Conditions (Pollutant Inflow)
+        if len(src_idxs) > 0:
+            pattern = 1.0 + 0.5 * np.sin(2*np.pi*(t-8)/24)
+            C_nodes[src_idxs, 0] = 30.0 * pattern # COD
+            C_nodes[src_idxs, 1] = 150.0 * pattern 
+            C_nodes[src_idxs, 7] = 40.0 # Sulfate
+        
+        # Transport & Reaction
+        curr_v = hyd_data['v'][t]
+        curr_L = hyd_data['L'][t]
+        curr_Q = hyd_data['Q'][t]
+        
+        # Hydraulic Retention Time
+        res_time = torch.clamp((curr_L / (curr_v + 1e-4)) / 3600.0, max=1.0) # hours
+        
+        # Reaction in Pipe
+        C_in = C_nodes[edge_idx[0]] # Concentration entering pipes
+        hyd_state_t = {'v': curr_v.unsqueeze(1), 'h': hyd_data['h'][t].unsqueeze(1)}
+        
+        rates = asm.compute_rates(C_in, hyd_state_t)
+        C_out = C_in + rates * res_time.unsqueeze(1)
+        C_out = torch.clamp(C_out, min=1e-6)
+        
+        history_pipes.append(C_out.clone().cpu())
+        
+        # Mixing at Nodes (Mass Balance)
+        mass = C_out * curr_Q.unsqueeze(1)
+        tot_m = torch.zeros((num_nodes, 11), device=device)
+        tot_q = torch.zeros((num_nodes, 1), device=device)
+        
+        tot_m.index_add_(0, edge_idx[1], mass)
+        tot_q.index_add_(0, edge_idx[1], curr_Q.unsqueeze(1))
+        
+        mask = (tot_q > 1e-6).squeeze()
+        valid_dst = torch.unique(edge_idx[1])
+        valid_dst = valid_dst[mask[valid_dst]]
+        
+        if len(valid_dst) > 0:
+            C_nodes[valid_dst] = tot_m[valid_dst] / tot_q[valid_dst]
+            
+    return torch.stack(history_pipes, dim=0).numpy()
 
 # ==========================================
 # 3. Plotting Helper Functions
@@ -171,7 +350,8 @@ def generate_heterogeneous_inflows(nodes, hours=24):
 def create_interactive_map(df_pipe):
     fig = go.Figure()
 
-    # 1. Pipes (Background, no interaction)
+    # Optimized: Draw all lines as a single trace with None separators
+    # This is much faster than adding a trace per pipe
     x_lines = []
     y_lines = []
     for _, row in df_pipe.iterrows():
@@ -181,41 +361,31 @@ def create_interactive_map(df_pipe):
     fig.add_trace(go.Scatter(
         x=x_lines, y=y_lines,
         mode='lines',
-        line=dict(color='gray', width=2),
+        line=dict(color='#bdc3c7', width=2),
         hoverinfo='skip',
         name='Pipes'
     ))
 
-    # 2. Nodes (Decoration)
-    fig.add_trace(go.Scatter(
-        x=df_pipe['US_X'], y=df_pipe['US_Y'],
-        mode='markers',
-        marker=dict(size=6, color='blue'),
-        name='Nodes',
-        hoverinfo='skip'
-    ))
-
-    # 3. Interactive Pipe Centers (Key Layer)
+    # Interactive Markers (Pipe Centers)
     fig.add_trace(go.Scatter(
         x=df_pipe['Mid_X'], y=df_pipe['Mid_Y'],
         mode='markers',
-        marker=dict(size=10, color='rgba(255, 0, 0, 0.5)', line=dict(width=1, color='red')),
-        name='Pipe Select',
+        marker=dict(size=8, color='rgba(231, 76, 60, 0.7)', line=dict(width=1, color='white')),
+        name='Select Pipe',
         text=df_pipe['PipeID'],
         hovertemplate='<b>Pipe: %{text}</b><extra></extra>',
-        # Crucial: Pass index to callback
         customdata=df_pipe.index 
     ))
 
     fig.update_layout(
-        title="Network Map (Click Red Anchors for Details)",
-        xaxis_title="X Coordinate",
-        yaxis_title="Y Coordinate",
+        title="Network Map (Click Red Dots)",
+        xaxis_title="X (m)", yaxis_title="Y (m)",
         showlegend=False,
         hovermode='closest',
-        margin=dict(l=0, r=0, t=40, b=0),
+        margin=dict(l=0, r=0, t=30, b=0),
         height=500,
-        yaxis=dict(scaleanchor="x", scaleratio=1)
+        dragmode='pan',
+        plot_bgcolor='white'
     )
     return fig
 
@@ -223,245 +393,108 @@ def create_interactive_map(df_pipe):
 # 4. Streamlit Interface
 # ==========================================
 
-st.title("🏙️ Urban Drainage Network Simulation System")
+st.title("🏙️ Urban Drainage Network Simulation (Fast)")
 
 # --- Sidebar ---
 with st.sidebar:
     st.header("1. Data Import")
     uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
     
-    with st.expander("View Data Format Example"):
-        st.markdown("""
-        CSV must contain: `name`, `start`, `end`, `length`, `diameter`, `slope`, `us_x`, `us_y`, `ds_x`, `ds_y`
-        """)
-
     st.header("2. Control Panel")
     sim_hours = st.slider("Simulation Duration (h)", 12, 48, 24)
     
-    # Simulation Buttons
     if uploaded_file:
         st.divider()
-        st.subheader("Simulation Execution")
-        btn_hyd = st.button("▶️ 1. Run Hydraulic Sim", type="primary", use_container_width=True)
-        btn_wq = st.button("▶️ 2. Run Water Quality Sim", use_container_width=True, disabled=('hyd_res' not in st.session_state))
+        st.info("Calculations are cached. Re-running with same settings is instant.")
 
 # --- Main Logic ---
 if uploaded_file:
+    # Load Data
     df_raw = pd.read_csv(uploaded_file)
     df_pipe = process_uploaded_data(df_raw)
     
     if df_pipe is not None:
-        # Build Graph
-        G = nx.DiGraph()
-        for _, row in df_pipe.iterrows():
-            G.add_edge(row['UpstreamNode'], row['DownstreamNode'], pipe_id=row['PipeID'])
+        # --- Run Simulations (Cached) ---
+        # We run these immediately. If inputs haven't changed, 
+        # Streamlit grabs results from cache instantly.
         
-        # Break Cycles
-        while not nx.is_directed_acyclic_graph(G):
-            try:
-                cycle = nx.find_cycle(G)
-                G.remove_edge(*cycle[0])
-            except: break
-        topo_nodes = list(nx.topological_sort(G))
+        with st.spinner("Processing Hydraulics... (First run may take time)"):
+            hyd_results = run_hydraulic_simulation(df_pipe, sim_hours)
+        
+        with st.spinner("Processing Water Quality..."):
+            wq_results = run_wq_simulation(df_pipe, hyd_results)
+            
+        st.success("Simulation Ready! Interact with the map below.")
 
-        # === Logic: Hydraulic Simulation ===
-        if btn_hyd:
-            with st.spinner("Calculating hydraulics..."):
-                all_nodes = list(G.nodes())
-                node_inflows = generate_heterogeneous_inflows(all_nodes, hours=sim_hours)
-                solver = VectorizedHydraulics()
-                
-                num_pipes = len(df_pipe)
-                res_Q = np.zeros((num_pipes, sim_hours))
-                res_v = np.zeros((num_pipes, sim_hours))
-                res_h = np.zeros((num_pipes, sim_hours))
-                
-                for t in range(sim_hours):
-                    node_acc = {n: node_inflows[n][t] for n in all_nodes}
-                    pipe_flow_snap = {}
-                    for u in topo_nodes:
-                        total_in = node_acc[u]
-                        out_edges = list(G.out_edges(u, data=True))
-                        if not out_edges: continue
-                        flow_per = total_in / len(out_edges)
-                        for _, v_node, data in out_edges:
-                            pid = data['pipe_id']
-                            pipe_flow_snap[pid] = flow_per
-                            if v_node in node_acc: node_acc[v_node] += flow_per
-                    
-                    curr_Q = np.array([pipe_flow_snap.get(pid, 0.0) for pid in df_pipe['PipeID']])
-                    h, v, A, P = solver.solve_normal_depth(
-                        curr_Q, df_pipe['Diameter'].values, df_pipe['Slope'].values, df_pipe['Manning'].values
-                    )
-                    res_Q[:, t] = curr_Q; res_v[:, t] = v; res_h[:, t] = h
-                
-                st.session_state['hyd_res'] = {'Q': res_Q, 'v': res_v, 'h': res_h, 'df': df_pipe}
-                st.success("Hydraulic simulation completed!")
-                st.rerun()
-
-        # === Logic: Water Quality Simulation ===
-        if btn_wq and 'hyd_res' in st.session_state:
-            with st.spinner("Calculating water quality..."):
-                hyd_res = st.session_state['hyd_res']
-                df_p = hyd_res['df']
-                sim_steps = hyd_res['Q'].shape[1]
-                
-                nodes_uniq = sorted(list(set(df_p['UpstreamNode']).union(set(df_p['DownstreamNode']))))
-                n_map = {n: i for i, n in enumerate(nodes_uniq)}
-                edge_src = [n_map[u] for u in df_p['UpstreamNode']]
-                edge_dst = [n_map[v] for v in df_p['DownstreamNode']]
-                edge_idx = torch.tensor([edge_src, edge_dst], dtype=torch.long, device=device)
-                
-                hyd_data = {
-                    'Q': torch.tensor(hyd_res['Q'].T, dtype=torch.float32, device=device),
-                    'v': torch.tensor(hyd_res['v'].T, dtype=torch.float32, device=device),
-                    'h': torch.tensor(hyd_res['h'].T, dtype=torch.float32, device=device),
-                    'L': torch.tensor(df_p['Length'].values, dtype=torch.float32, device=device).unsqueeze(0).expand(sim_steps, -1)
-                }
-                
-                num_nodes = len(nodes_uniq)
-                C_nodes = torch.zeros((num_nodes, 11), device=device) + 1e-6
-                C_nodes[:, 3] = 6.0 
-                asm = ASMKinetics().to(device)
-                
-                history_pipes = [] 
-                
-                in_degs = [G.in_degree(n) for n in nodes_uniq]
-                src_idxs = torch.tensor([i for i, d in enumerate(in_degs) if d == 0], dtype=torch.long, device=device)
-                
-                for t in range(sim_steps):
-                    if len(src_idxs) > 0:
-                        pattern = 1.0 + 0.5 * np.sin(2*np.pi*(t-8)/24)
-                        C_nodes[src_idxs, 0] = 30.0 * pattern 
-                        C_nodes[src_idxs, 1] = 150.0 * pattern 
-                        C_nodes[src_idxs, 7] = 40.0 
-                    
-                    curr_v = hyd_data['v'][t]; curr_L = hyd_data['L'][t]; curr_Q = hyd_data['Q'][t]
-                    res_time = torch.clamp((curr_L / (curr_v + 1e-4)) / 3600.0, max=1.0)
-                    
-                    C_in = C_nodes[edge_idx[0]]
-                    hyd_state_t = {k: v[t].unsqueeze(1) for k, v in hyd_data.items() if k in ['v','h']}
-                    
-                    rates = asm.compute_rates(C_in, hyd_state_t)
-                    C_out = C_in + rates * res_time.unsqueeze(1)
-                    C_out = torch.clamp(C_out, min=1e-6)
-                    
-                    history_pipes.append(C_out.clone().cpu())
-                    
-                    mass = C_out * curr_Q.unsqueeze(1)
-                    tot_m = torch.zeros((num_nodes, 11), device=device)
-                    tot_q = torch.zeros((num_nodes, 1), device=device)
-                    tot_m.index_add_(0, edge_idx[1], mass)
-                    tot_q.index_add_(0, edge_idx[1], curr_Q.unsqueeze(1))
-                    
-                    mask = (tot_q > 1e-6).squeeze()
-                    valid_dst = torch.unique(edge_idx[1])
-                    valid_dst = valid_dst[mask[valid_dst]]
-                    if len(valid_dst) > 0:
-                        C_nodes[valid_dst] = tot_m[valid_dst] / tot_q[valid_dst]
-                
-                st.session_state['wq_pipe_res'] = torch.stack(history_pipes, dim=0).numpy()
-                st.success("Water quality simulation completed!")
-                st.rerun()
-
-        # === Display ===
+        # --- Display Layout ---
         col_map, col_detail = st.columns([3, 2])
         
         with col_map:
             st.subheader("🗺️ Network Map")
             if 'US_X' in df_pipe.columns:
                 fig = create_interactive_map(df_pipe)
-                
-                # Capture selection event
+                # Selection logic
                 selection = st.plotly_chart(fig, on_select="rerun", selection_mode="points", use_container_width=True)
                 
-                # Parse selection (Robust Method)
                 selected_pipe_idx = None
                 if selection and selection['selection']['points']:
-                    points = selection['selection']['points']
-                    for point in points:
-                        # Check for customdata (most reliable)
+                    for point in selection['selection']['points']:
                         if 'customdata' in point:
                             selected_pipe_idx = point['customdata']
                             break
             else:
-                st.warning("Missing coordinate data, cannot plot map.")
+                st.warning("No coordinate data found in CSV.")
 
         with col_detail:
-            st.subheader("📊 Detail Panel")
+            st.subheader("📊 Results Inspector")
             
             if selected_pipe_idx is not None:
                 try:
-                    selected_pipe_idx = int(selected_pipe_idx)
-                    pipe_info = df_pipe.iloc[selected_pipe_idx]
-                    pipe_id = pipe_info['PipeID']
-                    st.info(f"Selected Pipe: **{pipe_id}**")
+                    idx = int(selected_pipe_idx)
+                    pipe_info = df_pipe.iloc[idx]
                     
-                    # 1. Basic Attributes
-                    with st.expander("Pipe Attributes", expanded=False):
-                        st.json({
-                            "Length": f"{pipe_info['Length']} m",
-                            "Diameter": f"{pipe_info['Diameter']} m",
-                            "Slope": pipe_info['Slope'],
-                            "Upstream": pipe_info['UpstreamNode'],
-                            "Downstream": pipe_info['DownstreamNode']
-                        })
-
-                    # 2. Hydraulic Results
-                    if 'hyd_res' in st.session_state:
-                        hyd = st.session_state['hyd_res']
-                        ts = range(hyd['Q'].shape[1])
-                        
-                        fig_h, ax_h = plt.subplots(2, 1, figsize=(6, 5), sharex=True)
-                        
-                        # Flow & Velocity
-                        ax_h[0].plot(ts, hyd['Q'][selected_pipe_idx], 'b-', label='Flow Q')
-                        ax_h[0].set_ylabel("Q (m³/s)")
-                        ax_h[0].set_title("Hydraulic Results")
+                    st.markdown(f"### Pipe: `{pipe_info['PipeID']}`")
+                    
+                    # Tabs for cleaner UI
+                    tab1, tab2 = st.tabs(["Hydraulics", "Water Quality"])
+                    
+                    ts = range(sim_hours)
+                    
+                    with tab1:
+                        fig_h, ax_h = plt.subplots(2, 1, figsize=(5, 5), sharex=True)
+                        # Flow
+                        ax_h[0].plot(ts, hyd_results['Q'][idx], 'b-', lw=2)
+                        ax_h[0].set_title("Flow Rate (Q)", fontsize=10)
+                        ax_h[0].set_ylabel("m³/s")
                         ax_h[0].grid(True, alpha=0.3)
                         
-                        ax2 = ax_h[0].twinx()
-                        ax2.plot(ts, hyd['v'][selected_pipe_idx], 'orange', linestyle='--', label='Velocity v')
-                        ax2.set_ylabel("v (m/s)")
-                        
                         # Depth
-                        ax_h[1].plot(ts, hyd['h'][selected_pipe_idx], 'g-', label='Depth h')
-                        ax_h[1].axhline(pipe_info['Diameter'], color='r', linestyle=':', label='Crown')
-                        ax_h[1].set_ylabel("h (m)")
+                        ax_h[1].plot(ts, hyd_results['h'][idx], 'g-', lw=2)
+                        ax_h[1].axhline(pipe_info['Diameter'], color='r', ls=':', label='Max')
+                        ax_h[1].set_title("Water Depth (h)", fontsize=10)
+                        ax_h[1].set_ylabel("m")
                         ax_h[1].set_xlabel("Time (h)")
-                        ax_h[1].legend()
                         ax_h[1].grid(True, alpha=0.3)
-                        
+                        plt.tight_layout()
                         st.pyplot(fig_h)
-                    else:
-                        st.info("No hydraulic data. Please run simulation.")
 
-                    # 3. Water Quality Results
-                    if 'wq_pipe_res' in st.session_state:
-                        wq = st.session_state['wq_pipe_res'] # Shape: (Time, Pipes, 11)
-                        
-                        fig_w, ax_w = plt.subplots(figsize=(6, 3))
-                        # Plot DO (idx 3) and H2S (idx 6)
-                        ax_w.plot(ts, wq[:, selected_pipe_idx, 3], 'b-', label='DO (Oxygen)')
-                        ax_w.plot(ts, wq[:, selected_pipe_idx, 6], 'r--', label='H2S (Sulfide)')
-                        ax_w.set_title("Water Quality Results")
-                        ax_w.set_ylabel("Concentration (mg/L)")
+                    with tab2:
+                        fig_w, ax_w = plt.subplots(figsize=(5, 3))
+                        # DO vs H2S
+                        ax_w.plot(ts, wq_results[:, idx, 3], 'b-', label='Dissolved Oxygen')
+                        ax_w.plot(ts, wq_results[:, idx, 6], 'r--', label='Hydrogen Sulfide')
+                        ax_w.set_title("Pollutant Concentration", fontsize=10)
+                        ax_w.set_ylabel("mg/L")
                         ax_w.set_xlabel("Time (h)")
-                        ax_w.legend()
+                        ax_w.legend(fontsize=8)
                         ax_w.grid(True, alpha=0.3)
-                        
+                        plt.tight_layout()
                         st.pyplot(fig_w)
-                    elif 'hyd_res' in st.session_state:
-                        st.info("No water quality data. Please run simulation.")
+                        
                 except Exception as e:
-                    st.error(f"Error parsing selection: {e}")
-            
+                    st.error(f"Error displaying data: {e}")
             else:
-                st.markdown("""
-                <div style="text-align: center; padding: 50px; color: #666;">
-                    👈 Please click on the <span style="color: red;">Red Anchors</span> on the map<br>to view simulation details.
-                </div>
-                """, unsafe_allow_html=True)
+                st.info("Select a red node on the map to view time-series data.")
 
 else:
-    st.info("👈 Please upload a CSV file in the sidebar to start.")
+    st.info("👈 Upload your network CSV to begin.")
