@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 # ==========================================
 # 0. Configuration & Initialization
 # ==========================================
-st.set_page_config(page_title="Urban Sewer Simulation (Optimized)", layout="wide")
+st.set_page_config(page_title="Urban Sewer Simulation (Pro)", layout="wide")
 st.markdown("""
 <style>
 .main { background-color: #f8f9fa; }
@@ -28,24 +28,17 @@ warnings.filterwarnings('ignore')
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ==========================================
-# 1. Core Calculation Classes
+# 1. Core Calculation Classes (Same as before)
 # ==========================================
 
 class VectorizedHydraulics:
     def solve_normal_depth(self, Q_target, D, S, n):
-        # Prevent division by zero or negative sqrt
         S = np.where(S <= 1e-6, 1e-6, S)
         sqrt_S = np.sqrt(S)
-        
-        # Manning's full flow capacity
         Q_full_capacity = (1/n) * (np.pi*(D/2)**2) * ((D/4)**(2/3)) * sqrt_S
-        
         overloaded = Q_target >= Q_full_capacity
-        
-        # Target conveyance factor
         K_target = (Q_target * n) / sqrt_S
         
-        # Newton-Raphson Initialization
         theta = np.full_like(Q_target, np.pi, dtype=np.float64)
         mask_solve = (~overloaded) & (Q_target > 0.0001)
         
@@ -55,29 +48,20 @@ class VectorizedHydraulics:
             K_t_active = K_target[mask_solve]
             coef_active = (D_active**2) / 8
             
-            # Reduced iterations for performance (5 is usually enough for engineering precision)
             for _ in range(5):
                 sin_t = np.sin(theta_active)
                 cos_t = np.cos(theta_active)
                 A = coef_active * (theta_active - sin_t)
                 P = (D_active / 2) * theta_active
-                P[P < 1e-6] = 1e-6 # Safety
+                P[P < 1e-6] = 1e-6
                 R = A / P
-                
-                # Manning eq: K = A * R^(2/3)
                 f_val = A * (R**(2/3)) - K_t_active
-                
-                # Derivative approximation or exact derivative
                 dA_dth = coef_active * (1 - cos_t)
                 dP_dth = D_active / 2
-                
                 term1 = (5/3) * (A**(2/3)) * (P**(-2/3)) * dA_dth
                 term2 = (2/3) * (A**(5/3)) * (P**(-5/3)) * dP_dth
                 f_prime = term1 - term2
-                
-                # Avoid zero division
                 f_prime[np.abs(f_prime) < 1e-6] = 1e-6
-                
                 theta_active -= f_val / f_prime
                 theta_active = np.clip(theta_active, 1e-4, 2*np.pi - 1e-4)
             
@@ -85,59 +69,46 @@ class VectorizedHydraulics:
 
         theta[overloaded] = 2 * np.pi
         theta[Q_target <= 0.0001] = 0
-        
-        # Final Geometry
         h = (D / 2) * (1 - np.cos(theta / 2))
         A_final = (D**2 / 8) * (theta - np.sin(theta))
-        
-        # Velocity
         v = np.zeros_like(Q_target)
         valid_A = A_final > 1e-6
         v[valid_A] = Q_target[valid_A] / A_final[valid_A]
-        
         return h, v
 
 class ASMKinetics(nn.Module):
     def __init__(self):
         super().__init__()
-        # Standard ASM constants (simplified)
         self.uHO2 = 4.0; self.Ksw = 1.0; self.KO = 0.5; self.Yhw = 0.55
         self.qm = 0.5; self.XHf = 10.0; self.Kso4 = 62.85
         self.SO_sat = 8.0; self.Temp = 25.0; self.aw = 1.07
         
     def compute_rates(self, C, hydraulic_state):
-        # C shape: [Num_Pipes, 11]
+        # Indices: 0:XHw, 1:Xs1, 3:SO, 4:SF, 6:SHS, 7:SSO4, 8:CH4
         C = torch.clamp(C, min=0.0)
-        
-        # Unpack components (Vectorized slicing)
         XHw = C[:, 0:1]; Xs1 = C[:, 1:2]; SO = C[:, 3:4]; SF = C[:, 4:5]
         SHS = C[:, 6:7]; SSO4 = C[:, 7:8]
 
         vel = hydraulic_state['v']
         depth = hydraulic_state['h']
         
-        # Reaeration (O'Connor-Dobbins)
         depth_safe = torch.clamp(depth, min=1e-3)
         vel_safe = torch.clamp(vel, min=1e-3)
         K2_day = 3.93 * (vel_safe**0.5) / (depth_safe**1.5)
         Kla = K2_day / 24.0 * (1.024 ** (self.Temp - 20))
         Kla = torch.clamp(Kla, max=100.0)
-        
         phi = self.aw ** (self.Temp - 20)
         
-        # Monod Terms
         M_SF = SF / (self.Ksw + SF + 1e-6)
         M_SO = SO / (self.KO + SO + 1e-6)
-        M_SO_lim = self.KO / (self.KO + SO + 1e-6) # Inhibition
+        M_SO_lim = self.KO / (self.KO + SO + 1e-6)
         M_SSO4 = SSO4 / (self.Kso4 + SSO4 + 1e-6)
 
-        # Process Rates
         rho_grw = self.uHO2 * M_SF * M_SO * XHw * phi
-        rho_srb = 0.05 * M_SF * M_SSO4 * self.XHf * M_SO_lim * phi # Sulfate reducing
-        rho_sox = 2.0 * M_SO * SHS * phi # Sulfide oxidation
+        rho_srb = 0.05 * M_SF * M_SSO4 * self.XHf * M_SO_lim * phi
+        rho_sox = 2.0 * M_SO * SHS * phi
         rho_hyd = 2.0 * Xs1 * (XHw / (XHw + Xs1 + 1e-6)) * M_SO * phi
 
-        # Stoichiometry (Simplified)
         dXHw = rho_grw - 0.1 * XHw
         dXs1 = -rho_hyd
         dXs2 = torch.zeros_like(Xs1)
@@ -168,12 +139,9 @@ def process_uploaded_data(df):
     
     df['UpstreamNode'] = df['UpstreamNode'].astype(str)
     df['DownstreamNode'] = df['DownstreamNode'].astype(str)
-    
-    # Data Cleaning
     df['Slope'] = df['Slope'].clip(lower=0.001)
     if 'Manning' not in df.columns: df['Manning'] = 0.013
     
-    # Geometry for interaction
     if 'US_X' in df.columns and 'DS_X' in df.columns:
         df['Mid_X'] = (df['US_X'] + df['DS_X']) / 2
         df['Mid_Y'] = (df['US_Y'] + df['DS_Y']) / 2
@@ -185,8 +153,6 @@ def build_graph(df_pipe):
     G = nx.DiGraph()
     for _, row in df_pipe.iterrows():
         G.add_edge(row['UpstreamNode'], row['DownstreamNode'], pipe_id=row['PipeID'])
-    
-    # Simple cycle breaking
     while not nx.is_directed_acyclic_graph(G):
         try:
             cycle = nx.find_cycle(G)
@@ -196,15 +162,10 @@ def build_graph(df_pipe):
 
 @st.cache_data
 def run_hydraulic_simulation(df_pipe, sim_hours):
-    """
-    Cached Hydraulic Simulation.
-    This function only runs when inputs change.
-    """
     G = build_graph(df_pipe)
     topo_nodes = list(nx.topological_sort(G))
     all_nodes = list(G.nodes())
     
-    # Generate Inflows
     np.random.seed(42)
     node_inflows = {}
     time_steps = np.arange(sim_hours)
@@ -215,45 +176,32 @@ def run_hydraulic_simulation(df_pipe, sim_hours):
 
     solver = VectorizedHydraulics()
     num_pipes = len(df_pipe)
-    
-    # Pre-allocate arrays
     res_Q = np.zeros((num_pipes, sim_hours))
     res_v = np.zeros((num_pipes, sim_hours))
     res_h = np.zeros((num_pipes, sim_hours))
-    
     pipe_id_to_idx = {pid: i for i, pid in enumerate(df_pipe['PipeID'])}
     
-    # Time Loop
     for t in range(sim_hours):
-        # Current inflow snapshot
         node_acc = {n: node_inflows[n][t] for n in all_nodes}
-        
-        # Topological Routing (Python Loop - unavoidable without C++ but cached now)
         current_Q_map = {}
         for u in topo_nodes:
             total_in = node_acc[u]
             out_edges = list(G.out_edges(u, data=True))
             if not out_edges: continue
-            
             flow_per = total_in / len(out_edges)
             for _, v_node, data in out_edges:
                 pid = data['pipe_id']
                 current_Q_map[pid] = flow_per
                 if v_node in node_acc: node_acc[v_node] += flow_per
         
-        # Vectorized Hydraulic Calculation
         curr_Q_arr = np.zeros(num_pipes)
         for pid, q_val in current_Q_map.items():
             if pid in pipe_id_to_idx:
                 curr_Q_arr[pipe_id_to_idx[pid]] = q_val
                 
         h, v = solver.solve_normal_depth(
-            curr_Q_arr, 
-            df_pipe['Diameter'].values, 
-            df_pipe['Slope'].values, 
-            df_pipe['Manning'].values
+            curr_Q_arr, df_pipe['Diameter'].values, df_pipe['Slope'].values, df_pipe['Manning'].values
         )
-        
         res_Q[:, t] = curr_Q_arr
         res_v[:, t] = v
         res_h[:, t] = h
@@ -262,23 +210,14 @@ def run_hydraulic_simulation(df_pipe, sim_hours):
 
 @st.cache_data
 def run_wq_simulation(df_pipe, hyd_res_dict):
-    """
-    Cached Water Quality Simulation.
-    Uses PyTorch for matrix operations.
-    """
-    # Reconstruct necessary data from dict
-    Q = hyd_res_dict['Q']
-    v = hyd_res_dict['v']
-    h = hyd_res_dict['h']
+    Q = hyd_res_dict['Q']; v = hyd_res_dict['v']; h = hyd_res_dict['h']
     sim_steps = Q.shape[1]
     
-    # Graph structures for tensor indexing
     nodes_uniq = sorted(list(set(df_pipe['UpstreamNode']).union(set(df_pipe['DownstreamNode']))))
     n_map = {n: i for i, n in enumerate(nodes_uniq)}
     edge_src = [n_map[u] for u in df_pipe['UpstreamNode']]
     edge_dst = [n_map[v] for v in df_pipe['DownstreamNode']]
     
-    # To Device
     edge_idx = torch.tensor([edge_src, edge_dst], dtype=torch.long, device=device)
     hyd_data = {
         'Q': torch.tensor(Q.T, dtype=torch.float32, device=device),
@@ -289,35 +228,27 @@ def run_wq_simulation(df_pipe, hyd_res_dict):
     
     num_nodes = len(nodes_uniq)
     C_nodes = torch.zeros((num_nodes, 11), device=device) + 1e-6
-    C_nodes[:, 3] = 6.0 # Initial DO
+    C_nodes[:, 3] = 6.0 
     
     asm = ASMKinetics().to(device)
     history_pipes = []
     
-    # Identify Source Nodes
     G = build_graph(df_pipe)
     in_degs = [G.in_degree(n) for n in nodes_uniq]
     src_idxs = torch.tensor([i for i, d in enumerate(in_degs) if d == 0], dtype=torch.long, device=device)
     
-    # Time Stepping
     for t in range(sim_steps):
-        # Boundary Conditions (Pollutant Inflow)
         if len(src_idxs) > 0:
             pattern = 1.0 + 0.5 * np.sin(2*np.pi*(t-8)/24)
-            C_nodes[src_idxs, 0] = 30.0 * pattern # COD
+            C_nodes[src_idxs, 0] = 30.0 * pattern 
             C_nodes[src_idxs, 1] = 150.0 * pattern 
-            C_nodes[src_idxs, 7] = 40.0 # Sulfate
+            C_nodes[src_idxs, 4] = 100.0 * pattern # Soluble COD
+            C_nodes[src_idxs, 7] = 40.0 
         
-        # Transport & Reaction
-        curr_v = hyd_data['v'][t]
-        curr_L = hyd_data['L'][t]
-        curr_Q = hyd_data['Q'][t]
+        curr_v = hyd_data['v'][t]; curr_L = hyd_data['L'][t]; curr_Q = hyd_data['Q'][t]
+        res_time = torch.clamp((curr_L / (curr_v + 1e-4)) / 3600.0, max=1.0)
         
-        # Hydraulic Retention Time
-        res_time = torch.clamp((curr_L / (curr_v + 1e-4)) / 3600.0, max=1.0) # hours
-        
-        # Reaction in Pipe
-        C_in = C_nodes[edge_idx[0]] # Concentration entering pipes
+        C_in = C_nodes[edge_idx[0]]
         hyd_state_t = {'v': curr_v.unsqueeze(1), 'h': hyd_data['h'][t].unsqueeze(1)}
         
         rates = asm.compute_rates(C_in, hyd_state_t)
@@ -326,18 +257,15 @@ def run_wq_simulation(df_pipe, hyd_res_dict):
         
         history_pipes.append(C_out.clone().cpu())
         
-        # Mixing at Nodes (Mass Balance)
         mass = C_out * curr_Q.unsqueeze(1)
         tot_m = torch.zeros((num_nodes, 11), device=device)
         tot_q = torch.zeros((num_nodes, 1), device=device)
-        
         tot_m.index_add_(0, edge_idx[1], mass)
         tot_q.index_add_(0, edge_idx[1], curr_Q.unsqueeze(1))
         
         mask = (tot_q > 1e-6).squeeze()
         valid_dst = torch.unique(edge_idx[1])
         valid_dst = valid_dst[mask[valid_dst]]
-        
         if len(valid_dst) > 0:
             C_nodes[valid_dst] = tot_m[valid_dst] / tot_q[valid_dst]
             
@@ -350,8 +278,7 @@ def run_wq_simulation(df_pipe, hyd_res_dict):
 def create_interactive_map(df_pipe):
     fig = go.Figure()
 
-    # Optimized: Draw all lines as a single trace with None separators
-    # This is much faster than adding a trace per pipe
+    # 1. Pipes
     x_lines = []
     y_lines = []
     for _, row in df_pipe.iterrows():
@@ -366,7 +293,7 @@ def create_interactive_map(df_pipe):
         name='Pipes'
     ))
 
-    # Interactive Markers (Pipe Centers)
+    # 2. Interactive Pipe Centers
     fig.add_trace(go.Scatter(
         x=df_pipe['Mid_X'], y=df_pipe['Mid_Y'],
         mode='markers',
@@ -377,15 +304,41 @@ def create_interactive_map(df_pipe):
         customdata=df_pipe.index 
     ))
 
+    # 3. Identify and Mark WWTP (Sinks)
+    # Logic: Nodes that appear in Downstream but NOT in Upstream
+    us_nodes = set(df_pipe['UpstreamNode'])
+    ds_nodes = set(df_pipe['DownstreamNode'])
+    sinks = ds_nodes - us_nodes
+    
+    sink_x = []
+    sink_y = []
+    for sink in sinks:
+        # Find a pipe that ends at this sink to get coordinates
+        # We take the first match
+        pipe_ending = df_pipe[df_pipe['DownstreamNode'] == sink].iloc[0]
+        sink_x.append(pipe_ending['DS_X'])
+        sink_y.append(pipe_ending['DS_Y'])
+
+    if sink_x:
+        fig.add_trace(go.Scatter(
+            x=sink_x, y=sink_y,
+            mode='markers',
+            marker=dict(size=15, color='#2ecc71', symbol='square', line=dict(width=2, color='white')),
+            name='WWTP / Outfall',
+            hoverinfo='text',
+            text=['WWTP / Outfall'] * len(sink_x)
+        ))
+
     fig.update_layout(
-        title="Network Map (Click Red Dots)",
+        title="Network Map (Green = WWTP, Red = Pipes)",
         xaxis_title="X (m)", yaxis_title="Y (m)",
-        showlegend=False,
+        showlegend=True,
         hovermode='closest',
         margin=dict(l=0, r=0, t=30, b=0),
         height=500,
         dragmode='pan',
-        plot_bgcolor='white'
+        plot_bgcolor='white',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
     return fig
 
@@ -393,7 +346,7 @@ def create_interactive_map(df_pipe):
 # 4. Streamlit Interface
 # ==========================================
 
-st.title("🏙️ Urban Drainage Network Simulation (Fast)")
+st.title("🏙️ Urban Drainage Network Simulation (Pro)")
 
 # --- Sidebar ---
 with st.sidebar:
@@ -409,22 +362,17 @@ with st.sidebar:
 
 # --- Main Logic ---
 if uploaded_file:
-    # Load Data
     df_raw = pd.read_csv(uploaded_file)
     df_pipe = process_uploaded_data(df_raw)
     
     if df_pipe is not None:
-        # --- Run Simulations (Cached) ---
-        # We run these immediately. If inputs haven't changed, 
-        # Streamlit grabs results from cache instantly.
-        
-        with st.spinner("Processing Hydraulics... (First run may take time)"):
+        with st.spinner("Processing Hydraulics..."):
             hyd_results = run_hydraulic_simulation(df_pipe, sim_hours)
         
         with st.spinner("Processing Water Quality..."):
             wq_results = run_wq_simulation(df_pipe, hyd_results)
             
-        st.success("Simulation Ready! Interact with the map below.")
+        st.success("Simulation Ready! Click red dots to inspect pipes.")
 
         # --- Display Layout ---
         col_map, col_detail = st.columns([3, 2])
@@ -433,7 +381,6 @@ if uploaded_file:
             st.subheader("🗺️ Network Map")
             if 'US_X' in df_pipe.columns:
                 fig = create_interactive_map(df_pipe)
-                # Selection logic
                 selection = st.plotly_chart(fig, on_select="rerun", selection_mode="points", use_container_width=True)
                 
                 selected_pipe_idx = None
@@ -455,20 +402,16 @@ if uploaded_file:
                     
                     st.markdown(f"### Pipe: `{pipe_info['PipeID']}`")
                     
-                    # Tabs for cleaner UI
-                    tab1, tab2 = st.tabs(["Hydraulics", "Water Quality"])
-                    
+                    tab1, tab2 = st.tabs(["💧 Hydraulics", "🧪 Water Quality"])
                     ts = range(sim_hours)
                     
                     with tab1:
                         fig_h, ax_h = plt.subplots(2, 1, figsize=(5, 5), sharex=True)
-                        # Flow
                         ax_h[0].plot(ts, hyd_results['Q'][idx], 'b-', lw=2)
                         ax_h[0].set_title("Flow Rate (Q)", fontsize=10)
                         ax_h[0].set_ylabel("m³/s")
                         ax_h[0].grid(True, alpha=0.3)
                         
-                        # Depth
                         ax_h[1].plot(ts, hyd_results['h'][idx], 'g-', lw=2)
                         ax_h[1].axhline(pipe_info['Diameter'], color='r', ls=':', label='Max')
                         ax_h[1].set_title("Water Depth (h)", fontsize=10)
@@ -479,15 +422,30 @@ if uploaded_file:
                         st.pyplot(fig_h)
 
                     with tab2:
-                        fig_w, ax_w = plt.subplots(figsize=(5, 3))
-                        # DO vs H2S
-                        ax_w.plot(ts, wq_results[:, idx, 3], 'b-', label='Dissolved Oxygen')
-                        ax_w.plot(ts, wq_results[:, idx, 6], 'r--', label='Hydrogen Sulfide')
-                        ax_w.set_title("Pollutant Concentration", fontsize=10)
-                        ax_w.set_ylabel("mg/L")
-                        ax_w.set_xlabel("Time (h)")
-                        ax_w.legend(fontsize=8)
-                        ax_w.grid(True, alpha=0.3)
+                        # Extracting specific pollutants
+                        # Index 1: Xs1 (Particulate), Index 4: SF (Soluble) -> Total COD
+                        cod_series = wq_results[:, idx, 1] + wq_results[:, idx, 4]
+                        so4_series = wq_results[:, idx, 7] # Sulfate
+                        ch4_series = wq_results[:, idx, 8] # Methane
+                        
+                        fig_w, ax_w = plt.subplots(3, 1, figsize=(5, 8), sharex=True)
+                        
+                        # COD Plot
+                        ax_w[0].plot(ts, cod_series, color='#8e44ad', lw=2)
+                        ax_w[0].set_title("Total COD (mg/L)", fontsize=10)
+                        ax_w[0].grid(True, alpha=0.3)
+                        
+                        # SO4 Plot
+                        ax_w[1].plot(ts, so4_series, color='#f39c12', lw=2)
+                        ax_w[1].set_title("Sulfate (SO₄²⁻) (mg/L)", fontsize=10)
+                        ax_w[1].grid(True, alpha=0.3)
+                        
+                        # CH4 Plot
+                        ax_w[2].plot(ts, ch4_series, color='#c0392b', lw=2)
+                        ax_w[2].set_title("Methane (CH₄) (mg/L)", fontsize=10)
+                        ax_w[2].set_xlabel("Time (h)")
+                        ax_w[2].grid(True, alpha=0.3)
+                        
                         plt.tight_layout()
                         st.pyplot(fig_w)
                         
