@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 # ==========================================
 # 0. 配置与初始化
 # ==========================================
-st.set_page_config(page_title="Urban Sewer Simulation (Pro)", layout="wide")
+st.set_page_config(page_title="Urban Sewer Simulation (7-Day)", layout="wide")
 st.markdown("""
 <style>
 .main { background-color: #f8f9fa; }
@@ -177,9 +177,14 @@ def run_hydraulic_simulation(df_pipe, sim_hours):
     np.random.seed(42)
     node_inflows = {}
     time_steps = np.arange(sim_hours)
+    
+    # === 关键修改：使用模运算 (%) 强制24小时循环 ===
+    hour_of_day = time_steps % 24
+    
     for node in all_nodes:
         base = np.random.uniform(0.001, 0.008)
-        pat = 0.3 + 0.6 * np.exp(-((time_steps - 8)**2) / 8) + 0.5 * np.exp(-((time_steps - 20)**2) / 8)
+        # 双峰模式：早高峰(8点) + 晚高峰(20点)
+        pat = 0.3 + 0.6 * np.exp(-((hour_of_day - 8)**2) / 8) + 0.5 * np.exp(-((hour_of_day - 20)**2) / 8)
         node_inflows[node] = np.maximum(base * pat, 0.0001)
 
     solver = VectorizedHydraulics()
@@ -251,7 +256,10 @@ def run_wq_simulation(df_pipe, hyd_res_dict, use_seawater, use_food_waste):
     
     for t in range(sim_steps):
         if len(src_idxs) > 0:
-            pattern = 1.0 + 0.5 * np.sin(2*np.pi*(t-8)/24)
+            # === 关键修改：使用模运算 (%) 强制24小时循环 ===
+            hour_of_day = t % 24
+            pattern = 1.0 + 0.5 * np.sin(2*np.pi*(hour_of_day-8)/24)
+            
             # 边界条件注入
             C_nodes[src_idxs, 0] = 30.0 * pattern * cod_multiplier # Biomass
             C_nodes[src_idxs, 1] = 150.0 * pattern * cod_multiplier # Particulate COD
@@ -356,7 +364,7 @@ def create_interactive_map(df_pipe):
 # 4. Streamlit 界面
 # ==========================================
 
-st.title("🏙️ Urban Drainage Network Simulation (Pro)")
+st.title("🏙️ Urban Drainage Network Simulation (7-Day)")
 
 # --- Sidebar ---
 with st.sidebar:
@@ -364,7 +372,9 @@ with st.sidebar:
     uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
     
     st.header("2. Simulation Control")
-    sim_hours = st.slider("Duration (h)", 12, 48, 24)
+    # 延长到7天 (168小时)
+    sim_hours = st.slider("Duration (Hours)", min_value=24, max_value=168, value=48, step=12, 
+                          help="Max 7 days (168 hours). Diurnal pattern loops every 24h.")
     
     st.divider()
     st.header("3. Scenario Settings")
@@ -394,7 +404,7 @@ if uploaded_file:
         with st.spinner("Processing Water Quality..."):
             wq_results = run_wq_simulation(df_pipe, hyd_results, use_seawater, use_food_waste)
             
-        st.success("Simulation Ready! Click red dots to inspect pipes.")
+        st.success(f"Simulation Complete ({sim_hours} hours)! Click red dots to inspect pipes.")
 
         col_map, col_detail = st.columns([3, 2])
         
