@@ -457,15 +457,20 @@ if uploaded_file:
             st.subheader("🗺️ Network Map")
             if 'US_X' in df_pipe.columns:
                 fig = create_interactive_map(df_pipe)
+                # 启用选择功能
                 selection = st.plotly_chart(fig, on_select="rerun", selection_mode="points", use_container_width=True)
                 
                 selected_pipe_idx = None
+                # === 修复开始：增加安全性检查 ===
                 if selection and selection['selection']['points']:
                     for point in selection['selection']['points']:
-                        # customdata is now [inflow, index]
+                        # 检查 'customdata' 是否存在于点击的点中
+                        # 只有红色节点绑定了 customdata，绿色 WWTP 节点或线条没有
                         if 'customdata' in point:
+                            # customdata[1] 是我们在 create_interactive_map 中绑定的 df_pipe.index
                             selected_pipe_idx = point['customdata'][1] 
                             break
+                # === 修复结束 ===
             else:
                 st.warning("No coordinate data found in CSV.")
 
@@ -551,3 +556,4 @@ if uploaded_file:
 
 else:
     st.info("👈 Upload your network CSV to begin. Ensure it has an 'inflow_baseline' column.")
+
